@@ -52,35 +52,43 @@ def extract_card_info_ocr(image_bytes):
         cleaned_title = " ".join(cleaned_words)
 
         # -------------------------------------------------------------
-        # 2. COLLECTOR NUMBER (Targeting below the Illustrator line)
+        # 2. COLLECTOR NUMBER (Dual-Polarity Reader for Normal & SIR/Full-Art)
         # -------------------------------------------------------------
         detected_number = ""
 
-        # Region A: Modern Scarlet & Violet / Sword & Shield (Below Illustrator: 94% to 98.8%)
-        modern_bl = img[int(h * 0.94):int(h * 0.988), int(w * 0.03):int(w * 0.35)]
+        # Region A: Modern (Below Illus: 93.5% to 98.8% height, 3% to 35% width)
+        modern_bl = img[int(h * 0.935):int(h * 0.988), int(w * 0.03):int(w * 0.35)]
 
-        # Region B: Vintage & Mid-Era (Bottom-Right: 92% to 98.5%)
+        # Region B: Vintage & Mid-Era (Bottom-Right: 92% to 98.5% height, 68% to 95% width)
         vintage_br = img[int(h * 0.92):int(h * 0.985), int(w * 0.68):int(w * 0.95)]
 
         for reg in [modern_bl, vintage_br]:
-            g_channel = reg[:, :, 1]
-            c_scale = cv2.resize(g_channel, (0, 0), fx=3.5, fy=3.5, interpolation=cv2.INTER_CUBIC)
+            gray = cv2.cvtColor(reg, cv2.COLOR_BGR2GRAY)
+            scale = cv2.resize(gray, (0, 0), fx=3.5, fy=3.5, interpolation=cv2.INTER_CUBIC)
 
-            _, c_thresh = cv2.threshold(c_scale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            if np.mean(c_thresh) < 127:
-                c_thresh = cv2.bitwise_not(c_thresh)
+            # Test both standard and inverted thresholds to handle white-on-black pills
+            _, thresh_norm = cv2.threshold(scale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            thresh_inv = cv2.bitwise_not(thresh_norm)
 
-            c_padded = cv2.copyMakeBorder(c_thresh, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=255)
+            for candidate_thresh in [thresh_norm, thresh_inv]:
+                # Force characters to be black on white canvas for Tesseract
+                if np.mean(candidate_thresh) < 127:
+                    candidate_thresh = cv2.bitwise_not(candidate_thresh)
 
-            raw_corner = pytesseract.image_to_string(
-                c_padded,
-                config="--psm 6 -c tessedit_char_whitelist=0123456789/"
-            ).strip()
+                padded = cv2.copyMakeBorder(candidate_thresh, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=255)
 
-            # Strictly look for the slash pattern (e.g., 028/198 or 16/107)
-            match_slash = re.search(r'(\d{1,4})/\d{1,4}', raw_corner)
-            if match_slash:
-                detected_number = match_slash.group(1).lstrip("0")
+                raw_corner = pytesseract.image_to_string(
+                    padded,
+                    config="--psm 7 -c tessedit_char_whitelist=0123456789/"
+                ).strip()
+
+                # Look for XX/YY or XXX/YYY (e.g., 093/080)
+                match_slash = re.search(r'(\d{2,4})/\d{2,4}', raw_corner)
+                if match_slash:
+                    detected_number = match_slash.group(1).lstrip("0")
+                    break
+
+            if detected_number:
                 break
 
         return cleaned_title, detected_number
@@ -138,10 +146,11 @@ def search_tcgdex(card_name, detected_num=""):
                     })
 
             # Force exact collector number match to position 0
-            if detected_num:
-                matches.sort(
-                    key=lambda x: 0 if x["number"].lstrip("0") == str(detected_num) else 1
-                )
+                    # If collector number was detected, push matching number to the top
+                    if detected_num:
+                        matches.sort(
+                            key=lambda x: 0 if str(x["number"]).lstrip("0") == str(detected_num).lstrip("0") else 1
+                        )
 
             return matches
     except Exception as e:
