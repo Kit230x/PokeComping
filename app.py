@@ -170,13 +170,12 @@ else:
             # Local Scan Image
             with col_scan:
                 st.caption(f"Scan:")
-                st.image(Image.open(io.BytesIO(card["local_bytes"])), use_container_width=True)
-
+                st.image(Image.open(io.BytesIO(card["local_bytes"])), width="stretch")
             # High-res Reference Card Image from TCGdex
             with col_web:
                 st.caption("**Online Match:**")
                 if card["matched_card"] and card["matched_card"].get("image_url"):
-                    st.image(card["matched_card"]["image_url"], use_container_width=True)
+                   st.image(card["matched_card"]["image_url"], width="stretch")
                 else:
                     st.write("*(No visual match found)*")
 
