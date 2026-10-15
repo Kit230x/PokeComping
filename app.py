@@ -24,36 +24,33 @@ def extract_card_info_ocr(image_bytes):
         h, w, _ = img.shape
 
         # 1. TOP TITLE BOX
-        # Width starts at 7% so names like "Deoxys" or "Mew" aren't clipped!
-        # Height: 3.8% to 11.5% | Width: 7% to 58% (stops before HP/Energy symbols)
-        title_crop = img[int(h * 0.035):int(h * 0.115), int(w * 0.035):int(w * 0.58)]
+        # Width: 3.5% to 38% -> Cuts off right after the name, excluding the circles
+        title_crop = img[int(h * 0.035):int(h * 0.115), int(w * 0.035):int(w * 0.38)]
 
         t_gray = cv2.cvtColor(title_crop, cv2.COLOR_BGR2GRAY)
         t_scale = cv2.resize(t_gray, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
 
-        # Bilateral filter strips foil sheen while keeping crisp letter lines
-        t_clean = cv2.bilateralFilter(t_scale, 9, 75, 75)
-        _, t_thresh = cv2.threshold(t_clean, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Strip faint foil speckles and thin line circles
+        t_blur = cv2.GaussianBlur(t_scale, (3, 3), 0)
+        _, t_thresh = cv2.threshold(t_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        # Invert if text ended up white on black
+        # Invert if the background turned black
         if np.mean(t_thresh) < 127:
             t_thresh = cv2.bitwise_not(t_thresh)
 
-        # PSM 6 (uniform block of text) works significantly better than PSM 7 when letters are bold
-        raw_title = pytesseract.image_to_string(t_thresh, config="--psm 6").strip()
+        # Morphological opening strips faint hollow circle edges
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        t_clean = cv2.morphologyEx(t_thresh, cv2.MORPH_OPEN, kernel)
 
-        # Clean up text: remove symbols and drop evolution prefixes
-        cleaned_title = re.sub(r'[^a-zA-Z\s]', '', raw_title).strip()
+        # PSM 8 instructs Tesseract to treat the crop strictly as a single word
+        raw_title = pytesseract.image_to_string(
+            t_clean,
+            config="--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        ).strip()
 
-        # Programmatically filter out evolution artifacts if it caught them
-        cleaned_title = re.sub(r'(?i)\b(evolves|from|stage|basic)\b', '', cleaned_title).strip()
-
-        # Take the most prominent name word
-        words = [w for w in cleaned_title.split() if len(w) >= 3]
-        final_name = words[0] if words else cleaned_title
+        cleaned_title = re.sub(r'[^a-zA-Z]', '', raw_title).strip()
 
         # 2. BOTTOM COLLECTOR NUMBER (e.g. 16/107)
-        # Height: 91% to 98.5% | Width: 4% to 40% (covers both left-side and right-side numbers)
         num_crop = img[int(h * 0.91):int(h * 0.985), int(w * 0.04):int(w * 0.40)]
         n_gray = cv2.cvtColor(num_crop, cv2.COLOR_BGR2GRAY)
         n_scale = cv2.resize(n_gray, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
@@ -69,7 +66,7 @@ def extract_card_info_ocr(image_bytes):
         if match_slash:
             detected_number = match_slash.group(1).lstrip("0")
 
-        return final_name, detected_number
+        return cleaned_title, detected_number
     except Exception as e:
         print(f"OCR Error: {e}")
         return "", ""
@@ -229,8 +226,7 @@ else:
                     if raw is not None:
                         h, w, _ = raw.shape
 
-                        # --- REPLACE THIS EXACT LINE HERE ---
-                        crop_preview = raw[int(h * 0.035):int(h * 0.115), int(w * 0.035):int(w * 0.58)]                        # -----------------------------------
+                        crop_preview = raw[int(h * 0.035):int(h * 0.115), int(w * 0.035):int(w * 0.38)]
 
                         st.image(crop_preview, caption="Title Region Sent to OCR", width="stretch")
 
