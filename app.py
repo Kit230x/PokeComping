@@ -12,23 +12,87 @@ st.set_page_config(page_title="TCGComping - Automated Verification Queue", layou
 
 
 # ---------------------------------------------------------
+# Computer Vision: Card Boundary Detection & Deskewing
+# ---------------------------------------------------------
+def order_points(pts):
+    """Orders coordinates: [top-left, top-right, bottom-right, bottom-left]."""
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+def auto_align_card(img, target_w=750, target_h=1050):
+    """
+    Detects the outer boundary of the trading card, removes background
+    margins/scanner bed, deskews tilt, and warps to standard 750x1050 px.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Canny edge detection to pick up card borders
+    edged = cv2.Canny(blurred, 30, 150)
+
+    # Dilate slightly to close gaps in the edge contour
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    dilated = cv2.dilate(edged, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    card_cnt = None
+    for c in contours:
+        # Require contour to cover at least 30% of the image
+        if cv2.contourArea(c) < (img.shape[0] * img.shape[1] * 0.30):
+            break
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            card_cnt = approx
+            break
+
+    # If 4-point polygon was detected, perform perspective transform
+    if card_cnt is not None:
+        pts = card_cnt.reshape(4, 2)
+        rect = order_points(pts)
+        dst = np.array([
+            [0, 0],
+            [target_w - 1, 0],
+            [target_w - 1, target_h - 1],
+            [0, target_h - 1]
+        ], dtype="float32")
+        M = cv2.getPerspectiveTransform(rect, dst)
+        warped = cv2.warpPerspective(img, M, (target_w, target_h))
+        return warped
+
+    # Fallback: if edges blend into background, resize directly to target dimensions
+    return cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+
+# ---------------------------------------------------------
 # Local Computer Vision & OCR
 # ---------------------------------------------------------
 def extract_card_info_ocr(image_bytes):
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
+        raw_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if raw_img is None:
             return "", ""
 
-        h, w, _ = img.shape
+        # 1. Standardize card canvas to 750w x 1050h
+        img = auto_align_card(raw_img, target_w=750, target_h=1050)
 
         # -------------------------------------------------------------
-        # 1. TOP TITLE BOX (Captures full multi-word names like Mega Excadrill)
+        # 2. TITLE EXTRACTION (Standardized coordinates: Y: 40-120, X: 35-430)
         # -------------------------------------------------------------
-        title_crop = img[int(h * 0.035):int(h * 0.115), int(w * 0.035):int(w * 0.60)]
+        title_crop = img[40:120, 35:430]
         t_gray = cv2.cvtColor(title_crop, cv2.COLOR_BGR2GRAY)
-        t_scale = cv2.resize(t_gray, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        t_scale = cv2.resize(t_gray, (0, 0), fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
         t_blur = cv2.GaussianBlur(t_scale, (3, 3), 0)
         _, t_thresh = cv2.threshold(t_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
@@ -40,7 +104,6 @@ def extract_card_info_ocr(image_bytes):
 
         raw_title = pytesseract.image_to_string(t_clean, config="--psm 6").strip()
 
-        # Filter out UI words (Stage, Basic, HP, Evolves) while preserving full names
         ignore_words = {'stage', 'basic', 'evolves', 'from', 'hp', 'vstar', 'vmax'}
         cleaned_words = []
         for word in raw_title.split():
@@ -48,42 +111,38 @@ def extract_card_info_ocr(image_bytes):
             if len(clean) >= 2 and clean.lower() not in ignore_words:
                 cleaned_words.append(clean)
 
-        # Join words so multi-word names (e.g. "Mega Excadrill") are preserved
         cleaned_title = " ".join(cleaned_words)
 
         # -------------------------------------------------------------
-        # 2. COLLECTOR NUMBER (Dual-Polarity Reader for Normal & SIR/Full-Art)
+        # 3. COLLECTOR NUMBER (Dual-Zone Normalized Scanner)
         # -------------------------------------------------------------
         detected_number = ""
 
-        # Region A: Modern (Below Illus: 93.5% to 98.8% height, 3% to 35% width)
-        modern_bl = img[int(h * 0.935):int(h * 0.988), int(w * 0.03):int(w * 0.35)]
+        # Normalized Modern BL: Y: 980-1035, X: 25-260
+        modern_bl = img[980:1035, 25:260]
 
-        # Region B: Vintage & Mid-Era (Bottom-Right: 92% to 98.5% height, 68% to 95% width)
-        vintage_br = img[int(h * 0.92):int(h * 0.985), int(w * 0.68):int(w * 0.95)]
+        # Normalized Vintage/EX BR: Y: 965-1035, X: 520-720
+        vintage_br = img[965:1035, 520:720]
 
         for reg in [modern_bl, vintage_br]:
             gray = cv2.cvtColor(reg, cv2.COLOR_BGR2GRAY)
             scale = cv2.resize(gray, (0, 0), fx=3.5, fy=3.5, interpolation=cv2.INTER_CUBIC)
 
-            # Test both standard and inverted thresholds to handle white-on-black pills
             _, thresh_norm = cv2.threshold(scale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             thresh_inv = cv2.bitwise_not(thresh_norm)
 
-            for candidate_thresh in [thresh_norm, thresh_inv]:
-                # Force characters to be black on white canvas for Tesseract
-                if np.mean(candidate_thresh) < 127:
-                    candidate_thresh = cv2.bitwise_not(candidate_thresh)
+            for candidate in [thresh_norm, thresh_inv]:
+                if np.mean(candidate) < 127:
+                    candidate = cv2.bitwise_not(candidate)
 
-                padded = cv2.copyMakeBorder(candidate_thresh, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=255)
+                padded = cv2.copyMakeBorder(candidate, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=255)
 
                 raw_corner = pytesseract.image_to_string(
                     padded,
                     config="--psm 7 -c tessedit_char_whitelist=0123456789/"
                 ).strip()
 
-                # Look for XX/YY or XXX/YYY (e.g., 093/080)
-                match_slash = re.search(r'(\d{2,4})/\d{2,4}', raw_corner)
+                match_slash = re.search(r'(\d{1,4})/\d{1,4}', raw_corner)
                 if match_slash:
                     detected_number = match_slash.group(1).lstrip("0")
                     break
@@ -95,6 +154,7 @@ def extract_card_info_ocr(image_bytes):
     except Exception as e:
         print(f"OCR Error: {e}")
         return "", ""
+
 
 # ---------------------------------------------------------
 # TCGdex API + Fuzzy Matching
@@ -145,12 +205,10 @@ def search_tcgdex(card_name, detected_num=""):
                         "market_price": market_val
                     })
 
-            # Force exact collector number match to position 0
-                    # If collector number was detected, push matching number to the top
-                    if detected_num:
-                        matches.sort(
-                            key=lambda x: 0 if str(x["number"]).lstrip("0") == str(detected_num).lstrip("0") else 1
-                        )
+            if detected_num:
+                matches.sort(
+                    key=lambda x: 0 if str(x["number"]).lstrip("0") == str(detected_num).lstrip("0") else 1
+                )
 
             return matches
     except Exception as e:
@@ -230,25 +288,23 @@ else:
         with st.container():
             col_scan, col_web, col_info, col_del = st.columns([1.5, 1.5, 3.5, 1])
 
-            # Local Scan Image
             with col_scan:
                 st.caption(f"Scan:")
                 st.image(Image.open(io.BytesIO(card["local_bytes"])), width="stretch")
 
-                # Debug crop inspector
                 with st.expander("Show OCR Crop"):
                     nparr = np.frombuffer(card["local_bytes"], np.uint8)
                     raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if raw is not None:
-                        h, w, _ = raw.shape
-                        title_prev = raw[int(h * 0.035):int(h * 0.115), int(w * 0.035):int(w * 0.60)]
-                        bl_modern_prev = raw[int(h * 0.94):int(h * 0.988), int(w * 0.03):int(w * 0.35)]
-                        br_vintage_prev = raw[int(h * 0.92):int(h * 0.985), int(w * 0.68):int(w * 0.95)]
-                        st.image(title_prev, caption="Title Crop (Wide)", width="stretch")
-                        st.image(bl_modern_prev, caption="Modern Bottom-Left (Below Illus)", width="stretch")
-                        st.image(br_vintage_prev, caption="Vintage Bottom-Right", width="stretch")
+                        aligned = auto_align_card(raw, 750, 1050)
+                        title_prev = aligned[40:120, 35:430]
+                        modern_bl_prev = aligned[980:1035, 25:260]
+                        vintage_br_prev = aligned[965:1035, 520:720]
+                        st.image(aligned, caption="Detected & Deskewed Card", width="stretch")
+                        st.image(title_prev, caption="Title Region", width="stretch")
+                        st.image(modern_bl_prev, caption="Modern BL Number", width="stretch")
+                        st.image(vintage_br_prev, caption="Vintage BR Number", width="stretch")
 
-            # Online Reference Image
             with col_web:
                 st.caption("**Online Match:**")
                 if card["matched_card"] and card["matched_card"].get("image_url"):
@@ -256,7 +312,6 @@ else:
                 else:
                     st.write("*(No visual match found)*")
 
-            # Comps & Variant Dropdown
             with col_info:
                 display_ocr = card['ocr_name'] or "Not read"
                 if card.get('ocr_number'):
