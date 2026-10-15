@@ -62,55 +62,81 @@ def search_tcgdex(card_name):
 # ---------------------------------------------------------
 # Local Computer Vision & OCR
 # ---------------------------------------------------------
-def extract_card_name_ocr(image_bytes):
+def extract_card_info_ocr(image_bytes):
     """
-    Finds the card contour to discard external scanner margins,
-    then crops and processes the top title bar for Tesseract.
+    Extracts text from both the top header (name) and bottom footer (collector number)
+    using bilateral filtering to ignore foil noise.
     """
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img is None:
-            return ""
+            return "", ""
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Detect the card contour to ignore white/black margins
+        # 1. Detect card edges to trim scanner margins
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edged = cv2.Canny(blur, 30, 120)
+        edged = cv2.Canny(blur, 40, 150)
         contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         card_crop = img
         if contours:
-            # Find the largest bounding box (the card itself)
             largest = max(contours, key=cv2.contourArea)
             x, y, w_box, h_box = cv2.boundingRect(largest)
-            # Ensure it is at least 30% of the image size
-            if w_box > img.shape[1] * 0.3 and h_box > img.shape[0] * 0.3:
+            # Ensure detected contour is reasonably card-sized
+            if w_box > img.shape[1] * 0.4 and h_box > img.shape[0] * 0.4:
                 card_crop = img[y:y + h_box, x:x + w_box]
 
         h, w, _ = card_crop.shape
 
-        # Standard Modern Pokemon header coordinates relative to the card itself:
-        # Top 4% to 15% height, 6% to 75% width (isolates title, skips stage & HP)
-        title_region = card_crop[int(h * 0.04):int(h * 0.15), int(w * 0.06):int(w * 0.75)]
+        # --- A. BOTTOM COLLECTOR NUMBER (Most reliable for modern cards) ---
+        # Bottom 7% of the card, left 45% (where 064/165 or 125/198 lives)
+        num_crop = card_crop[int(h * 0.92):int(h * 0.985), int(w * 0.04):int(w * 0.45)]
+        num_gray = cv2.cvtColor(num_crop, cv2.COLOR_BGR2GRAY)
 
-        # Preprocessing: Grayscale, Upscaling for Tesseract, Adaptive Threshold
-        title_gray = cv2.cvtColor(title_region, cv2.COLOR_BGR2GRAY)
-        title_resized = cv2.resize(title_gray, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-        thresh = cv2.threshold(title_resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        # Enlarge for Tesseract clarity
+        num_resized = cv2.resize(num_gray, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        # Bilateral filter strips foil glare while keeping sharp letter boundaries
+        num_clean = cv2.bilateralFilter(num_resized, 9, 75, 75)
+        num_thresh = cv2.adaptiveThreshold(
+            num_clean, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4
+        )
 
-        # PSM 7: Treat the image as a single text line
-        raw_text = pytesseract.image_to_string(thresh, config="--psm 7")
+        # Look strictly for digits and slashes (e.g., 064/165 or 25)
+        num_text = pytesseract.image_to_string(
+            num_thresh,
+            config="--psm 6 -c tessedit_char_whitelist=0123456789/"
+        ).strip()
 
-        # Strip noise, symbols, and artifacts
-        cleaned = re.sub(r'[^a-zA-Z\s]', '', raw_text).strip()
-        first_line = cleaned.split("\n")[0].strip()
-        return first_line
+        # Extract "XXX/YYY" or pure numbers
+        match_slash = re.search(r'(\d{2,4}/\d{2,4})', num_text)
+        detected_number = match_slash.group(1).split("/")[0] if match_slash else ""
+
+        # --- B. TOP CARD NAME ---
+        # Top 4% to 14% height, 8% to 75% width
+        title_crop = card_crop[int(h * 0.04):int(h * 0.14), int(w * 0.08):int(w * 0.72)]
+        title_gray = cv2.cvtColor(title_crop, cv2.COLOR_BGR2GRAY)
+        title_resized = cv2.resize(title_gray, (0, 0), fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+        title_clean = cv2.bilateralFilter(title_resized, 9, 75, 75)
+
+        # Test whether text is dark-on-light or light-on-dark (Full Art / Dark cards)
+        mean_val = np.mean(title_clean)
+        if mean_val < 120:  # Dark background, white text
+            _, title_thresh = cv2.threshold(title_clean, 140, 255, cv2.THRESH_BINARY)
+        else:  # Light background, dark text
+            _, title_thresh = cv2.threshold(title_clean, 120, 255, cv2.THRESH_BINARY_INV)
+
+        raw_title = pytesseract.image_to_string(title_thresh, config="--psm 7").strip()
+        cleaned_title = re.sub(r'[^a-zA-Z\s]', '', raw_title).strip()
+        # Take the most prominent word (e.g., "Alakazam" or "Charizard")
+        words = [w for w in cleaned_title.split() if len(w) >= 3]
+        detected_name = words[0] if words else ""
+
+        return detected_name, detected_number
     except Exception as e:
         print(f"OCR Error: {e}")
-        return ""
-
+        return "", ""
 
 # ---------------------------------------------------------
 # App Session & Batch State
@@ -132,17 +158,20 @@ if st.sidebar.button("⚡ Scan & Auto-Comp Batch", type="primary"):
             if file.name not in existing:
                 raw_bytes = file.read()
 
-                # 1. OCR automatically reads card header
-                detected_name = extract_card_name_ocr(raw_bytes)
+                # 1. Run the updated OCR (extracts both name and collector number)
+                detected_name, detected_number = extract_card_info_ocr(raw_bytes)
 
-                # 2. Query TCGdex directly without any keys
-                matches = search_tcgdex(detected_name) if detected_name else []
+                # 2. Pick whichever detected value is strongest
+                search_term = detected_name if detected_name else detected_number
+
+                # 3. Query TCGdex
+                matches = search_tcgdex(search_term) if search_term else []
 
                 st.session_state.batch.append({
                     "id": f"{file.name}_{len(st.session_state.batch)}",
                     "filename": file.name,
                     "local_bytes": raw_bytes,
-                    "ocr_name": detected_name,
+                    "ocr_name": f"{detected_name} (#{detected_number})" if detected_number else detected_name,
                     "matched_card": matches[0] if matches else None,
                     "suggestions": matches,
                     "selected_index": 0
