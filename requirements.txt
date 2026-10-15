@@ -1,0 +1,5 @@
+cat <<EOT > requirements.txt
+streamlit
+requests
+pillow
+EOT
