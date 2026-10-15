@@ -63,15 +63,31 @@ def extract_card_info_ocr(image_bytes):
         ).strip()
 
         detected_number = ""
-        # Match XX/YY (e.g., 16/107, 025/198, 151/165)
-        match_slash = re.search(r'(\d{1,4})/\d{1,4}', raw_num)
-        if match_slash:
-            detected_number = match_slash.group(1).lstrip("0")
-        else:
-            # Fallback: look for 2-3 digit standalone numbers if slash was missed
-            digits = re.findall(r'\b\d{1,3}\b', raw_num)
-            if digits:
-                detected_number = digits[-1].lstrip("0")
+
+        # Crop right corner first (EX-era: 16/107)
+        right_num_crop = img[int(h * 0.92):int(h * 0.985), int(w * 0.65):int(w * 0.97)]
+        # Crop left corner (Modern: 064/165)
+        left_num_crop = img[int(h * 0.92):int(h * 0.985), int(w * 0.03):int(w * 0.38)]
+
+        for corner_img in [right_num_crop, left_num_crop]:
+            c_gray = cv2.cvtColor(corner_img, cv2.COLOR_BGR2GRAY)
+            c_scale = cv2.resize(c_gray, (0, 0), fx=3.5, fy=3.5, interpolation=cv2.INTER_CUBIC)
+
+            # Otsu binarization
+            _, c_thresh = cv2.threshold(c_scale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            if np.mean(c_thresh) < 127:
+                c_thresh = cv2.bitwise_not(c_thresh)
+
+            raw_corner = pytesseract.image_to_string(
+                c_thresh,
+                config="--psm 6 -c tessedit_char_whitelist=0123456789/"
+            ).strip()
+
+            # Strictly require the slash pattern (e.g. 16/107 or 025/198)
+            match_slash = re.search(r'(\d{1,4})/\d{1,4}', raw_corner)
+            if match_slash:
+                detected_number = match_slash.group(1).lstrip("0")
+                break  # Stop as soon as a verified collector number with slash is found
 
         return cleaned_title, detected_number
     except Exception as e:
