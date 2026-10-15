@@ -48,55 +48,39 @@ def extract_card_info_ocr(image_bytes):
         # 2. BOTTOM COLLECTOR NUMBER
         detected_number = ""
 
-        # Vintage / EX: Bottom-Right corner (focused directly on XX/YYY, skipping set symbol)
-        br_crop = img[int(h * 0.93):int(h * 0.985), int(w * 0.72):int(w * 0.93)]
-        # Modern: Bottom-Left corner
-        bl_crop = img[int(h * 0.93):int(h * 0.985), int(w * 0.03):int(w * 0.32)]
+        # Bottom-Right (Vintage/EX) & Bottom-Left (Modern)
+        br_crop = img[int(h * 0.92):int(h * 0.985), int(w * 0.70):int(w * 0.94)]
+        bl_crop = img[int(h * 0.92):int(h * 0.985), int(w * 0.03):int(w * 0.32)]
 
-        # --- A. Try Vintage/EX Bottom-Right First ---
-        br_gray = cv2.cvtColor(br_crop, cv2.COLOR_BGR2GRAY)
-        br_scale = cv2.resize(br_gray, (0, 0), fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
-        br_clean = cv2.bilateralFilter(br_scale, 7, 50, 50)
-        br_thresh = cv2.adaptiveThreshold(
-            br_clean, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 4
-        )
-        if np.mean(br_thresh) < 127:
-            br_thresh = cv2.bitwise_not(br_thresh)
+        for corner in [br_crop, bl_crop]:
+            c_gray = cv2.cvtColor(corner, cv2.COLOR_BGR2GRAY)
+            # 4x upscale for small sub-10px fonts
+            c_scale = cv2.resize(c_gray, (0, 0), fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
 
-        raw_br = pytesseract.image_to_string(
-            br_thresh,
-            config="--psm 6 -c tessedit_char_whitelist=0123456789/"
-        ).strip()
+            # Otsu thresholding
+            _, c_thresh = cv2.threshold(c_scale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            if np.mean(c_thresh) < 127:
+                c_thresh = cv2.bitwise_not(c_thresh)
 
-        match_slash_br = re.search(r'(\d{1,4})/\d{1,4}', raw_br)
-        if match_slash_br:
-            detected_number = match_slash_br.group(1).lstrip("0")
+            # Add white border padding so characters on the crop edge aren't truncated
+            c_padded = cv2.copyMakeBorder(c_thresh, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=255)
 
-        # --- B. If Vintage/EX wasn't found, try Modern Bottom-Left ---
-        if not detected_number:
-            bl_gray = cv2.cvtColor(bl_crop, cv2.COLOR_BGR2GRAY)
-            bl_scale = cv2.resize(bl_gray, (0, 0), fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
-            bl_clean = cv2.bilateralFilter(bl_scale, 7, 50, 50)
-            bl_thresh = cv2.adaptiveThreshold(
-                bl_clean, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 4
-            )
-            if np.mean(bl_thresh) < 127:
-                bl_thresh = cv2.bitwise_not(bl_thresh)
-
-            raw_bl = pytesseract.image_to_string(
-                bl_thresh,
-                config="--psm 6 -c tessedit_char_whitelist=0123456789/"
+            # PSM 7 treats the padded region as a single line of text
+            raw_corner = pytesseract.image_to_string(
+                c_padded,
+                config="--psm 7 -c tessedit_char_whitelist=0123456789/"
             ).strip()
 
-            match_slash_bl = re.search(r'(\d{1,4})/\d{1,4}', raw_bl)
-            if match_slash_bl:
-                detected_number = match_slash_bl.group(1).lstrip("0")
+            # Find XX/YY pattern
+            match_slash = re.search(r'(\d{1,4})/\d{1,4}', raw_corner)
+            if match_slash:
+                detected_number = match_slash.group(1).lstrip("0")
+                break
 
         return cleaned_title, detected_number
     except Exception as e:
         print(f"OCR Error: {e}")
         return "", ""
-
 # ---------------------------------------------------------
 # TCGdex API + Fuzzy Matching
 # ---------------------------------------------------------
@@ -247,7 +231,7 @@ else:
                         st.image(title_prev, caption="Title Crop", width="stretch")
                         st.image(br_prev, caption="Bottom-Right Corner (Vintage/EX)", width="stretch")
                         st.image(bl_prev, caption="Bottom-Left Corner (Modern)", width="stretch")
-                        
+
             # Online Reference Image
             with col_web:
                 st.caption("**Online Match:**")
