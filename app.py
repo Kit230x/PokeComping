@@ -15,12 +15,6 @@ st.set_page_config(page_title="TCGComping - Automated Verification Queue", layou
 # Local Computer Vision & OCR
 # ---------------------------------------------------------
 def extract_card_info_ocr(image_bytes):
-    """
-    Fixed-coordinate box crops tailored to modern Pokemon layouts:
-    - Starts at 20% width to skip 'Evolves from' text.
-    - Captures the exact title line.
-    - Captures the bottom collector number.
-    """
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -29,23 +23,38 @@ def extract_card_info_ocr(image_bytes):
 
         h, w, _ = img.shape
 
-        # 1. TOP TITLE BOX (Skips 'Evolves from' box on left)
-        # Height: 3.5% to 11.5% | Width: 20% to 70%
-        title_crop = img[int(h * 0.035):int(h * 0.115), int(w * 0.20):int(w * 0.70)]
-        t_gray = cv2.cvtColor(title_crop, cv2.COLOR_BGR2GRAY)
-        t_scale = cv2.resize(t_gray, (0, 0), fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
-        _, t_thresh = cv2.threshold(t_scale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # 1. TOP TITLE BOX
+        # Width starts at 7% so names like "Deoxys" or "Mew" aren't clipped!
+        # Height: 3.8% to 11.5% | Width: 7% to 58% (stops before HP/Energy symbols)
+        title_crop = img[int(h * 0.038):int(h * 0.115), int(w * 0.07):int(w * 0.58)]
 
-        # Invert if text is white-on-dark
+        t_gray = cv2.cvtColor(title_crop, cv2.COLOR_BGR2GRAY)
+        t_scale = cv2.resize(t_gray, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+
+        # Bilateral filter strips foil sheen while keeping crisp letter lines
+        t_clean = cv2.bilateralFilter(t_scale, 9, 75, 75)
+        _, t_thresh = cv2.threshold(t_clean, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Invert if text ended up white on black
         if np.mean(t_thresh) < 127:
             t_thresh = cv2.bitwise_not(t_thresh)
 
-        raw_title = pytesseract.image_to_string(t_thresh, config="--psm 7").strip()
+        # PSM 6 (uniform block of text) works significantly better than PSM 7 when letters are bold
+        raw_title = pytesseract.image_to_string(t_thresh, config="--psm 6").strip()
+
+        # Clean up text: remove symbols and drop evolution prefixes
         cleaned_title = re.sub(r'[^a-zA-Z\s]', '', raw_title).strip()
 
-        # 2. BOTTOM COLLECTOR NUMBER BOX (e.g. 064/165)
-        # Height: 93% to 98.5% | Width: 4% to 35%
-        num_crop = img[int(h * 0.93):int(h * 0.985), int(w * 0.04):int(w * 0.35)]
+        # Programmatically filter out evolution artifacts if it caught them
+        cleaned_title = re.sub(r'(?i)\b(evolves|from|stage|basic)\b', '', cleaned_title).strip()
+
+        # Take the most prominent name word
+        words = [w for w in cleaned_title.split() if len(w) >= 3]
+        final_name = words[0] if words else cleaned_title
+
+        # 2. BOTTOM COLLECTOR NUMBER (e.g. 16/107)
+        # Height: 91% to 98.5% | Width: 4% to 40% (covers both left-side and right-side numbers)
+        num_crop = img[int(h * 0.91):int(h * 0.985), int(w * 0.04):int(w * 0.40)]
         n_gray = cv2.cvtColor(num_crop, cv2.COLOR_BGR2GRAY)
         n_scale = cv2.resize(n_gray, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
         _, n_thresh = cv2.threshold(n_scale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -56,15 +65,14 @@ def extract_card_info_ocr(image_bytes):
         ).strip()
 
         detected_number = ""
-        match_slash = re.search(r'(\d{2,4})/\d{2,4}', raw_num)
+        match_slash = re.search(r'(\d{1,4})/\d{1,4}', raw_num)
         if match_slash:
             detected_number = match_slash.group(1).lstrip("0")
 
-        return cleaned_title, detected_number
+        return final_name, detected_number
     except Exception as e:
         print(f"OCR Error: {e}")
         return "", ""
-
 
 # ---------------------------------------------------------
 # TCGdex API + Fuzzy Matching
@@ -220,7 +228,11 @@ else:
                     raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if raw is not None:
                         h, w, _ = raw.shape
+
+                        # --- REPLACE THIS EXACT LINE HERE ---
                         crop_preview = raw[int(h * 0.035):int(h * 0.115), int(w * 0.20):int(w * 0.70)]
+                        # -----------------------------------
+
                         st.image(crop_preview, caption="Title Region Sent to OCR", width="stretch")
 
             # High-res Reference Card Image from TCGdex
