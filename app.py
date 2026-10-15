@@ -247,7 +247,7 @@ else:
                         st.image(title_prev, caption="Title Crop", width="stretch")
                         st.image(br_prev, caption="Bottom-Right Corner (Vintage/EX)", width="stretch")
                         st.image(bl_prev, caption="Bottom-Left Corner (Modern)", width="stretch")
-
+                        
             # Online Reference Image
             with col_web:
                 st.caption("**Online Match:**")
