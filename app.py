@@ -14,10 +14,7 @@ st.set_page_config(page_title="TCGComping - Automated Zero-Cost", layout="wide")
 # TCGdex API (100% Free - No Keys, No Paywalls)
 # ---------------------------------------------------------
 def search_tcgdex(card_name):
-    """
-    Queries TCGdex open-source API for Pokemon cards and pulls
-    card images along with live TCGplayer market prices.
-    """
+    """Safely searches TCGdex without crashing on NoneType pricing or missing variants."""
     clean_name = card_name.strip()
     if not clean_name or len(clean_name) < 2:
         return []
@@ -30,7 +27,6 @@ def search_tcgdex(card_name):
             if not isinstance(brief_list, list):
                 return []
 
-            # Take top 6 matching cards and fetch their details/pricing
             matches = []
             for item in brief_list[:6]:
                 card_id = item.get("id")
@@ -38,12 +34,16 @@ def search_tcgdex(card_name):
                 if detail_res.status_code == 200:
                     d = detail_res.json()
 
-                    # Extract TCGPlayer Market Price
-                    pricing = d.get("pricing", {}).get("tcgplayer", {})
+                    # Safely handle NoneType pricing blocks
+                    pricing_data = d.get("pricing") or {}
+                    tcg_pricing = pricing_data.get("tcgplayer") or {}
+
                     market_val = 0.0
-                    for variant in ["normal", "holofoil", "reverse-holofoil", "unlimited"]:
-                        if variant in pricing and pricing[variant].get("marketPrice"):
-                            market_val = float(pricing[variant]["marketPrice"])
+                    # TCGdex uses 'normal', 'reverse', and 'holo'
+                    for variant in ["normal", "reverse", "holo"]:
+                        var_obj = tcg_pricing.get(variant)
+                        if isinstance(var_obj, dict) and var_obj.get("marketPrice"):
+                            market_val = float(var_obj["marketPrice"])
                             break
 
                     matches.append({
@@ -59,14 +59,13 @@ def search_tcgdex(card_name):
         print(f"TCGdex error: {e}")
     return []
 
-
 # ---------------------------------------------------------
 # Local Computer Vision & OCR
 # ---------------------------------------------------------
 def extract_card_name_ocr(image_bytes):
     """
-    Crops the top header area of a centered ScanSnap scan
-    and extracts the card name using PyTesseract.
+    Finds the card contour to discard external scanner margins,
+    then crops and processes the top title bar for Tesseract.
     """
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -74,19 +73,40 @@ def extract_card_name_ocr(image_bytes):
         if img is None:
             return ""
 
-        h, w, _ = img.shape
-        # Top 15% height, 8% to 75% width (isolates title and drops HP/energy icons)
-        top_crop = img[int(h * 0.03):int(h * 0.15), int(w * 0.08):int(w * 0.75)]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Preprocess: Grayscale and Otsu binarization
-        gray = cv2.cvtColor(top_crop, cv2.COLOR_BGR2GRAY)
-        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        # Detect the card contour to ignore white/black margins
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edged = cv2.Canny(blur, 30, 120)
+        contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Extract text via Tesseract (single text line mode)
-        text = pytesseract.image_to_string(thresh, config="--psm 7")
-        cleaned = re.sub(r'[^a-zA-Z\s]', '', text).strip()
-        first_word = cleaned.split("\n")[0].strip()
-        return first_word
+        card_crop = img
+        if contours:
+            # Find the largest bounding box (the card itself)
+            largest = max(contours, key=cv2.contourArea)
+            x, y, w_box, h_box = cv2.boundingRect(largest)
+            # Ensure it is at least 30% of the image size
+            if w_box > img.shape[1] * 0.3 and h_box > img.shape[0] * 0.3:
+                card_crop = img[y:y + h_box, x:x + w_box]
+
+        h, w, _ = card_crop.shape
+
+        # Standard Modern Pokemon header coordinates relative to the card itself:
+        # Top 4% to 15% height, 6% to 75% width (isolates title, skips stage & HP)
+        title_region = card_crop[int(h * 0.04):int(h * 0.15), int(w * 0.06):int(w * 0.75)]
+
+        # Preprocessing: Grayscale, Upscaling for Tesseract, Adaptive Threshold
+        title_gray = cv2.cvtColor(title_region, cv2.COLOR_BGR2GRAY)
+        title_resized = cv2.resize(title_gray, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        thresh = cv2.threshold(title_resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+        # PSM 7: Treat the image as a single text line
+        raw_text = pytesseract.image_to_string(thresh, config="--psm 7")
+
+        # Strip noise, symbols, and artifacts
+        cleaned = re.sub(r'[^a-zA-Z\s]', '', raw_text).strip()
+        first_line = cleaned.split("\n")[0].strip()
+        return first_line
     except Exception as e:
         print(f"OCR Error: {e}")
         return ""
