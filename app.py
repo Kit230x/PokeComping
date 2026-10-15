@@ -23,8 +23,10 @@ def extract_card_info_ocr(image_bytes):
 
         h, w, _ = img.shape
 
-        # 1. TOP TITLE BOX
-        title_crop = img[int(h * 0.035):int(h * 0.115), int(w * 0.035):int(w * 0.38)]
+        # -------------------------------------------------------------
+        # 1. TOP TITLE BOX (Width widened to 55% for long names like Aurorus)
+        # -------------------------------------------------------------
+        title_crop = img[int(h * 0.035):int(h * 0.115), int(w * 0.035):int(w * 0.55)]
         t_gray = cv2.cvtColor(title_crop, cv2.COLOR_BGR2GRAY)
         t_scale = cv2.resize(t_gray, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
         t_blur = cv2.GaussianBlur(t_scale, (3, 3), 0)
@@ -38,40 +40,53 @@ def extract_card_info_ocr(image_bytes):
 
         raw_title = pytesseract.image_to_string(
             t_clean,
-            config="--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+            config="--psm 6"
         ).strip()
 
-        cleaned_title = re.sub(r'[^a-zA-Z]', '', raw_title).strip()
+        # Strip stage tags, evolution words, numbers, and HP
+        cleaned_words = []
+        for word in raw_title.split():
+            clean = re.sub(r'[^a-zA-Z]', '', word)
+            if len(clean) >= 3 and clean.lower() not in ['stage', 'basic', 'evolves', 'from', 'hp']:
+                cleaned_words.append(clean)
+
+        cleaned_title = cleaned_words[0] if cleaned_words else ""
         if len(cleaned_title) > 4 and cleaned_title[0].islower() and cleaned_title[1].isupper():
             cleaned_title = cleaned_title[1:]
 
-        # 2. BOTTOM COLLECTOR NUMBER
+        # -------------------------------------------------------------
+        # 2. COLLECTOR NUMBER (Multi-Era Scanner)
+        # -------------------------------------------------------------
         detected_number = ""
 
-        # Bottom-Right (Vintage/EX) & Bottom-Left (Modern)
-        br_crop = img[int(h * 0.92):int(h * 0.985), int(w * 0.70):int(w * 0.94)]
-        bl_crop = img[int(h * 0.92):int(h * 0.985), int(w * 0.03):int(w * 0.32)]
+        # Region A: Modern Scarlet & Violet / Sword & Shield (Bottom-Left, slightly above bottom rim)
+        # Height: 86% to 95% | Width: 3% to 32%
+        modern_bl = img[int(h * 0.86):int(h * 0.95), int(w * 0.03):int(w * 0.32)]
 
-        for corner in [br_crop, bl_crop]:
-            c_gray = cv2.cvtColor(corner, cv2.COLOR_BGR2GRAY)
-            # 4x upscale for small sub-10px fonts
-            c_scale = cv2.resize(c_gray, (0, 0), fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
+        # Region B: Vintage & Mid-Era EX/DP/BW/XY/SM (Bottom-Right)
+        # Height: 90% to 98% | Width: 68% to 95%
+        vintage_br = img[int(h * 0.90):int(h * 0.98), int(w * 0.68):int(w * 0.95)]
+
+        candidate_regions = [modern_bl, vintage_br]
+
+        for reg in candidate_regions:
+            # Check Green channel (best contrast for colored text) & Grayscale
+            g_channel = reg[:, :, 1]
+            c_scale = cv2.resize(g_channel, (0, 0), fx=3.5, fy=3.5, interpolation=cv2.INTER_CUBIC)
 
             # Otsu thresholding
             _, c_thresh = cv2.threshold(c_scale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             if np.mean(c_thresh) < 127:
                 c_thresh = cv2.bitwise_not(c_thresh)
 
-            # Add white border padding so characters on the crop edge aren't truncated
             c_padded = cv2.copyMakeBorder(c_thresh, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=255)
 
-            # PSM 7 treats the padded region as a single line of text
             raw_corner = pytesseract.image_to_string(
                 c_padded,
-                config="--psm 7 -c tessedit_char_whitelist=0123456789/"
+                config="--psm 6 -c tessedit_char_whitelist=0123456789/"
             ).strip()
 
-            # Find XX/YY pattern
+            # Find XX/YY or XXX/YYY pattern
             match_slash = re.search(r'(\d{1,4})/\d{1,4}', raw_corner)
             if match_slash:
                 detected_number = match_slash.group(1).lstrip("0")
@@ -81,6 +96,7 @@ def extract_card_info_ocr(image_bytes):
     except Exception as e:
         print(f"OCR Error: {e}")
         return "", ""
+
 # ---------------------------------------------------------
 # TCGdex API + Fuzzy Matching
 # ---------------------------------------------------------
@@ -225,12 +241,12 @@ else:
                     raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if raw is not None:
                         h, w, _ = raw.shape
-                        title_prev = raw[int(h * 0.035):int(h * 0.115), int(w * 0.035):int(w * 0.38)]
-                        br_prev = raw[int(h * 0.93):int(h * 0.985), int(w * 0.72):int(w * 0.93)]
-                        bl_prev = raw[int(h * 0.93):int(h * 0.985), int(w * 0.03):int(w * 0.32)]
-                        st.image(title_prev, caption="Title Crop", width="stretch")
-                        st.image(br_prev, caption="Bottom-Right Corner (Vintage/EX)", width="stretch")
-                        st.image(bl_prev, caption="Bottom-Left Corner (Modern)", width="stretch")
+                        title_prev = raw[int(h * 0.035):int(h * 0.115), int(w * 0.035):int(w * 0.55)]
+                        bl_modern_prev = raw[int(h * 0.86):int(h * 0.95), int(w * 0.03):int(w * 0.32)]
+                        br_vintage_prev = raw[int(h * 0.90):int(h * 0.98), int(w * 0.68):int(w * 0.95)]
+                        st.image(title_prev, caption="Title Crop (Wide)", width="stretch")
+                        st.image(bl_modern_prev, caption="Modern Bottom-Left", width="stretch")
+                        st.image(br_vintage_prev, caption="Vintage Bottom-Right", width="stretch")
 
             # Online Reference Image
             with col_web:
