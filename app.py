@@ -26,7 +26,7 @@ def extract_card_info_ocr(image_bytes):
         # 1. TOP TITLE BOX
         # Width starts at 7% so names like "Deoxys" or "Mew" aren't clipped!
         # Height: 3.8% to 11.5% | Width: 7% to 58% (stops before HP/Energy symbols)
-        title_crop = img[int(h * 0.038):int(h * 0.115), int(w * 0.07):int(w * 0.58)]
+        title_crop = img[int(h * 0.035):int(h * 0.115), int(w * 0.035):int(w * 0.58)]
 
         t_gray = cv2.cvtColor(title_crop, cv2.COLOR_BGR2GRAY)
         t_scale = cv2.resize(t_gray, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
@@ -230,8 +230,7 @@ else:
                         h, w, _ = raw.shape
 
                         # --- REPLACE THIS EXACT LINE HERE ---
-                        crop_preview = raw[int(h * 0.035):int(h * 0.115), int(w * 0.20):int(w * 0.70)]
-                        # -----------------------------------
+                        crop_preview = raw[int(h * 0.035):int(h * 0.115), int(w * 0.035):int(w * 0.58)]                        # -----------------------------------
 
                         st.image(crop_preview, caption="Title Region Sent to OCR", width="stretch")
 
