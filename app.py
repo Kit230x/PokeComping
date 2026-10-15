@@ -6,42 +6,109 @@ import cv2
 import numpy as np
 import io
 import re
+from rapidfuzz import process, fuzz
 
-st.set_page_config(page_title="TCGComping - Automated Zero-Cost", layout="wide")
+st.set_page_config(page_title="TCGComping - Automated Verification Queue", layout="wide")
 
 
 # ---------------------------------------------------------
-# TCGdex API (100% Free - No Keys, No Paywalls)
+# Local Computer Vision & OCR
 # ---------------------------------------------------------
-def search_tcgdex(card_name):
-    """Safely searches TCGdex without crashing on NoneType pricing or missing variants."""
+def extract_card_info_ocr(image_bytes):
+    """
+    Fixed-coordinate box crops tailored to modern Pokemon layouts:
+    - Starts at 20% width to skip 'Evolves from' text.
+    - Captures the exact title line.
+    - Captures the bottom collector number.
+    """
+    try:
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return "", ""
+
+        h, w, _ = img.shape
+
+        # 1. TOP TITLE BOX (Skips 'Evolves from' box on left)
+        # Height: 3.5% to 11.5% | Width: 20% to 70%
+        title_crop = img[int(h * 0.035):int(h * 0.115), int(w * 0.20):int(w * 0.70)]
+        t_gray = cv2.cvtColor(title_crop, cv2.COLOR_BGR2GRAY)
+        t_scale = cv2.resize(t_gray, (0, 0), fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+        _, t_thresh = cv2.threshold(t_scale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Invert if text is white-on-dark
+        if np.mean(t_thresh) < 127:
+            t_thresh = cv2.bitwise_not(t_thresh)
+
+        raw_title = pytesseract.image_to_string(t_thresh, config="--psm 7").strip()
+        cleaned_title = re.sub(r'[^a-zA-Z\s]', '', raw_title).strip()
+
+        # 2. BOTTOM COLLECTOR NUMBER BOX (e.g. 064/165)
+        # Height: 93% to 98.5% | Width: 4% to 35%
+        num_crop = img[int(h * 0.93):int(h * 0.985), int(w * 0.04):int(w * 0.35)]
+        n_gray = cv2.cvtColor(num_crop, cv2.COLOR_BGR2GRAY)
+        n_scale = cv2.resize(n_gray, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        _, n_thresh = cv2.threshold(n_scale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        raw_num = pytesseract.image_to_string(
+            n_thresh,
+            config="--psm 6 -c tessedit_char_whitelist=0123456789/"
+        ).strip()
+
+        detected_number = ""
+        match_slash = re.search(r'(\d{2,4})/\d{2,4}', raw_num)
+        if match_slash:
+            detected_number = match_slash.group(1).lstrip("0")
+
+        return cleaned_title, detected_number
+    except Exception as e:
+        print(f"OCR Error: {e}")
+        return "", ""
+
+
+# ---------------------------------------------------------
+# TCGdex API + Fuzzy Matching
+# ---------------------------------------------------------
+def search_tcgdex(card_name, detected_num=""):
+    """
+    Queries TCGdex and uses RapidFuzz to resolve OCR misspellings
+    (e.g., 'Armalda' -> 'Armaldo').
+    """
     clean_name = card_name.strip()
-    if not clean_name or len(clean_name) < 2:
+    if not clean_name and not detected_num:
         return []
 
-    url = f"https://api.tcgdex.net/v2/en/cards?name={clean_name}"
+    # Use first 4 characters as seed to fetch candidates
+    seed = clean_name[:4] if len(clean_name) >= 4 else clean_name
+    url = f"https://api.tcgdex.net/v2/en/cards?name={seed}" if seed else "https://api.tcgdex.net/v2/en/cards"
+
     try:
         res = requests.get(url, timeout=8)
         if res.status_code == 200:
             brief_list = res.json()
-            if not isinstance(brief_list, list):
+            if not isinstance(brief_list, list) or not brief_list:
                 return []
 
+            # Fuzzy match candidate names against OCR text
+            name_choices = {item["id"]: item["name"] for item in brief_list}
+            scored_matches = process.extract(
+                clean_name,
+                name_choices,
+                scorer=fuzz.ratio,
+                limit=6
+            )
+
             matches = []
-            for item in brief_list[:6]:
-                card_id = item.get("id")
-                detail_res = requests.get(f"https://api.tcgdex.net/v2/en/cards/{card_id}", timeout=6)
-                if detail_res.status_code == 200:
-                    d = detail_res.json()
+            for candidate_name, score, card_id in scored_matches:
+                d_res = requests.get(f"https://api.tcgdex.net/v2/en/cards/{card_id}", timeout=5)
+                if d_res.status_code == 200:
+                    d = d_res.json()
 
-                    # Safely handle NoneType pricing blocks
-                    pricing_data = d.get("pricing") or {}
-                    tcg_pricing = pricing_data.get("tcgplayer") or {}
-
+                    # Safe null-checked extraction of TCGplayer market price
+                    pricing = (d.get("pricing") or {}).get("tcgplayer") or {}
                     market_val = 0.0
-                    # TCGdex uses 'normal', 'reverse', and 'holo'
                     for variant in ["normal", "reverse", "holo"]:
-                        var_obj = tcg_pricing.get(variant)
+                        var_obj = pricing.get(variant)
                         if isinstance(var_obj, dict) and var_obj.get("marketPrice"):
                             market_val = float(var_obj["marketPrice"])
                             break
@@ -54,89 +121,18 @@ def search_tcgdex(card_name):
                         "image_url": f"{d.get('image')}/high.webp" if d.get("image") else None,
                         "market_price": market_val
                     })
+
+            # If collector number was detected, prioritize matching number
+            if detected_num:
+                matches.sort(
+                    key=lambda x: 0 if str(x["number"]).lstrip("0") == str(detected_num) else 1
+                )
+
             return matches
     except Exception as e:
         print(f"TCGdex error: {e}")
     return []
 
-# ---------------------------------------------------------
-# Local Computer Vision & OCR
-# ---------------------------------------------------------
-def extract_card_info_ocr(image_bytes):
-    """
-    Extracts text from both the top header (name) and bottom footer (collector number)
-    using bilateral filtering to ignore foil noise.
-    """
-    try:
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
-            return "", ""
-
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # 1. Detect card edges to trim scanner margins
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edged = cv2.Canny(blur, 40, 150)
-        contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        card_crop = img
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            x, y, w_box, h_box = cv2.boundingRect(largest)
-            # Ensure detected contour is reasonably card-sized
-            if w_box > img.shape[1] * 0.4 and h_box > img.shape[0] * 0.4:
-                card_crop = img[y:y + h_box, x:x + w_box]
-
-        h, w, _ = card_crop.shape
-
-        # --- A. BOTTOM COLLECTOR NUMBER (Most reliable for modern cards) ---
-        # Bottom 7% of the card, left 45% (where 064/165 or 125/198 lives)
-        num_crop = card_crop[int(h * 0.92):int(h * 0.985), int(w * 0.04):int(w * 0.45)]
-        num_gray = cv2.cvtColor(num_crop, cv2.COLOR_BGR2GRAY)
-
-        # Enlarge for Tesseract clarity
-        num_resized = cv2.resize(num_gray, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
-        # Bilateral filter strips foil glare while keeping sharp letter boundaries
-        num_clean = cv2.bilateralFilter(num_resized, 9, 75, 75)
-        num_thresh = cv2.adaptiveThreshold(
-            num_clean, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4
-        )
-
-        # Look strictly for digits and slashes (e.g., 064/165 or 25)
-        num_text = pytesseract.image_to_string(
-            num_thresh,
-            config="--psm 6 -c tessedit_char_whitelist=0123456789/"
-        ).strip()
-
-        # Extract "XXX/YYY" or pure numbers
-        match_slash = re.search(r'(\d{2,4}/\d{2,4})', num_text)
-        detected_number = match_slash.group(1).split("/")[0] if match_slash else ""
-
-        # --- B. TOP CARD NAME ---
-        # Top 4% to 14% height, 8% to 75% width
-        title_crop = card_crop[int(h * 0.04):int(h * 0.14), int(w * 0.08):int(w * 0.72)]
-        title_gray = cv2.cvtColor(title_crop, cv2.COLOR_BGR2GRAY)
-        title_resized = cv2.resize(title_gray, (0, 0), fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
-        title_clean = cv2.bilateralFilter(title_resized, 9, 75, 75)
-
-        # Test whether text is dark-on-light or light-on-dark (Full Art / Dark cards)
-        mean_val = np.mean(title_clean)
-        if mean_val < 120:  # Dark background, white text
-            _, title_thresh = cv2.threshold(title_clean, 140, 255, cv2.THRESH_BINARY)
-        else:  # Light background, dark text
-            _, title_thresh = cv2.threshold(title_clean, 120, 255, cv2.THRESH_BINARY_INV)
-
-        raw_title = pytesseract.image_to_string(title_thresh, config="--psm 7").strip()
-        cleaned_title = re.sub(r'[^a-zA-Z\s]', '', raw_title).strip()
-        # Take the most prominent word (e.g., "Alakazam" or "Charizard")
-        words = [w for w in cleaned_title.split() if len(w) >= 3]
-        detected_name = words[0] if words else ""
-
-        return detected_name, detected_number
-    except Exception as e:
-        print(f"OCR Error: {e}")
-        return "", ""
 
 # ---------------------------------------------------------
 # App Session & Batch State
@@ -158,20 +154,18 @@ if st.sidebar.button("⚡ Scan & Auto-Comp Batch", type="primary"):
             if file.name not in existing:
                 raw_bytes = file.read()
 
-                # 1. Run the updated OCR (extracts both name and collector number)
+                # 1. Automatic OCR extraction
                 detected_name, detected_number = extract_card_info_ocr(raw_bytes)
 
-                # 2. Pick whichever detected value is strongest
-                search_term = detected_name if detected_name else detected_number
-
-                # 3. Query TCGdex
-                matches = search_tcgdex(search_term) if search_term else []
+                # 2. Automated fuzzy query
+                matches = search_tcgdex(detected_name, detected_number)
 
                 st.session_state.batch.append({
                     "id": f"{file.name}_{len(st.session_state.batch)}",
                     "filename": file.name,
                     "local_bytes": raw_bytes,
-                    "ocr_name": f"{detected_name} (#{detected_number})" if detected_number else detected_name,
+                    "ocr_name": detected_name,
+                    "ocr_number": detected_number,
                     "matched_card": matches[0] if matches else None,
                     "suggestions": matches,
                     "selected_index": 0
@@ -179,7 +173,7 @@ if st.sidebar.button("⚡ Scan & Auto-Comp Batch", type="primary"):
         st.rerun()
 
 # ---------------------------------------------------------
-# Dashboard & Valuation
+# Header & Total Valuation Toolbar
 # ---------------------------------------------------------
 st.title("🗂️ TCGComping Verification Queue")
 
@@ -209,8 +203,7 @@ st.markdown("---")
 # Verification Queue
 # ---------------------------------------------------------
 if not st.session_state.batch:
-    st.info(
-        "Drop your scans in the sidebar and click 'Scan & Auto-Comp Batch'. It will auto-read names and comp cards without keys or subscriptions.")
+    st.info("Drop your scans in the sidebar and click 'Scan & Auto-Comp Batch'. Cards will comp automatically.")
 else:
     for card in st.session_state.batch:
         with st.container():
@@ -220,17 +213,30 @@ else:
             with col_scan:
                 st.caption(f"Scan:")
                 st.image(Image.open(io.BytesIO(card["local_bytes"])), width="stretch")
+
+                # Debug crop inspector
+                with st.expander("Show OCR Crop"):
+                    nparr = np.frombuffer(card["local_bytes"], np.uint8)
+                    raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    if raw is not None:
+                        h, w, _ = raw.shape
+                        crop_preview = raw[int(h * 0.035):int(h * 0.115), int(w * 0.20):int(w * 0.70)]
+                        st.image(crop_preview, caption="Title Region Sent to OCR", width="stretch")
+
             # High-res Reference Card Image from TCGdex
             with col_web:
                 st.caption("**Online Match:**")
                 if card["matched_card"] and card["matched_card"].get("image_url"):
-                   st.image(card["matched_card"]["image_url"], width="stretch")
+                    st.image(card["matched_card"]["image_url"], width="stretch")
                 else:
                     st.write("*(No visual match found)*")
 
             # Comps & Suggestions
             with col_info:
-                st.write(f"**OCR Read:** `{card['ocr_name'] or 'Could not detect text'}`")
+                display_ocr = card['ocr_name'] or "Not read"
+                if card.get('ocr_number'):
+                    display_ocr += f" (#{card['ocr_number']})"
+                st.write(f"**OCR Detected:** `{display_ocr}`")
 
                 if card["suggestions"]:
                     opts = [
@@ -253,7 +259,6 @@ else:
                     st.markdown(f"### Market Price: :green[**${m['market_price']:.2f}**]")
                     st.caption(f"{m['set_name']} • #{m['number']} • Near Mint")
                 else:
-                    # Fallback input if the scan crop was completely illegible
                     new_term = st.text_input("Manual Search (Fallback)", value=card["ocr_name"],
                                              key=f"manual_{card['id']}")
                     if st.button("Retry Search", key=f"retry_{card['id']}"):
