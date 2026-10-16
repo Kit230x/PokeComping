@@ -47,7 +47,17 @@ if run_scan:
                 candidates = search_cards(signals["name"])
                 ranked = rank_candidates(signals, candidates, aligned)
                 best = ranked[0] if ranked else None
-                auto_ok = bool(best and best["confidence"] >= threshold and best["evidence"]["name_score"] >= 0.72)
+                # Never auto-select on name similarity alone when OCR found a collector number.
+                # A number conflict or uncertain OCR should go to the review queue.
+                number_score = (best or {}).get("evidence", {}).get("collector_number_score", 0) or 0
+                number_present = bool(signals.get("number"))
+                auto_ok = bool(
+                    best
+                    and best.get("confidence") is not None
+                    and best["confidence"] >= threshold
+                    and best.get("evidence", {}).get("name_score", 0) >= 0.72
+                    and (not number_present or number_score >= 0.99)
+                )
                 chosen = best if (allow_auto and auto_ok) else None
                 new_items.append({
                     "id": f"{uploaded.name}_{len(st.session_state.batch) + len(new_items)}",
@@ -127,8 +137,16 @@ if cards:
                         st.code(card["ocr_debug"])
                 candidates = card.get("candidates", [])
                 if candidates:
+                    def safe_float(value, default=0.0):
+                        try:
+                            return float(value) if value is not None else default
+                        except (TypeError, ValueError):
+                            return default
+
                     labels = [
-                        f"{c['name']} — {c['set_name']} (#{c['number']}) | {c['confidence']:.0%} | ${c['market_price']:.2f}"
+                        f"{c.get('name') or 'Unknown card'} — {c.get('set_name') or 'Unknown set'} "
+                        f"(#{c.get('number') or '?'}) | {safe_float(c.get('confidence')):.0%} | "
+                        f"${safe_float(c.get('market_price')):.2f}"
                         for c in candidates
                     ]
                     current_index = next((i for i, c in enumerate(candidates) if match and c["id"] == match["id"]), 0)
@@ -146,9 +164,13 @@ if cards:
                         st.rerun()
                     match = card.get("matched_card")
                     if match:
-                        st.markdown(f"**Market price:** ${match.get('market_price', 0.0):.2f}")
+                        price = match.get("market_price")
+                        confidence = match.get("confidence")
+                        price_text = f"${safe_float(price):.2f}" if price is not None else "Unavailable"
+                        confidence_text = f"{safe_float(confidence):.0%}" if confidence is not None else "Unavailable"
+                        st.markdown(f"**Market price:** {price_text}")
                         st.caption(
-                            f"{match['set_name']} • #{match['number']} • confidence {match['confidence']:.0%}"
+                            f"{match.get('set_name') or 'Unknown set'} • #{match.get('number') or '?'} • confidence {confidence_text}"
                         )
                         with st.expander("Why this candidate ranked here"):
                             st.json(match["evidence"])
