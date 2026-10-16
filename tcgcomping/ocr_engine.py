@@ -93,7 +93,9 @@ def extract_card_signals(card_bgr):
                 number_candidates.append((3, value, label, raw))
 
         # Pass 2: letters allowed, for prefixed and promo numbers.
-        raw = _read(crop, 7, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/ -")
+        # No space or hyphen in the whitelist: pytesseract splits the config on spaces,
+        # which turned "/ -" into a stray "-" argument and crashed Tesseract.
+        raw = _read(crop, 7, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/")
         upper = raw.upper()
         found = PREFIXED_SLASH_RE.search(upper)
         if found:
