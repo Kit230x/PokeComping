@@ -10,11 +10,33 @@ import cv2
 import numpy as np
 import pytesseract
 
+# Card label words printed near the name that are not part of it. Add more here if a new
+# card layout leaks a label into the name. Matching is fuzzy (see _is_label), so truncated
+# OCR reads like "BASI" or "STAGEI" are caught too.
 IGNORE_TITLE_WORDS = {
-    "stage", "basic", "evolves", "from", "hp", "vstar", "vmax", "rule",
-    "ability", "weakness", "resistance", "retreat", "pokemon",
-    "supporter", "trainer", "item", "tool", "stadium",
+    "basic", "stage", "trainer", "supporter", "item", "tool", "stadium",
+    "evolves", "from", "pokemon", "pokémon", "hp", "vstar", "vmax", "rule",
+    "ability", "weakness", "resistance", "retreat",
 }
+# Deliberately NOT ignored, because real card names contain them: "Energy" (Double Turbo
+# Energy), "Special" (Special Charm), "Ace" (Ace Trainer), "Mega", "Tera", "Radiant".
+
+
+def _is_label(word):
+    """True for label words like BASIC / STAGE 2 / TRAINER, including clipped OCR reads."""
+    w = re.sub(r"[^a-z]", "", str(word).lower())
+    if not w:
+        return False
+    if w in IGNORE_TITLE_WORDS:
+        return True
+    if len(w) >= 4:
+        for label in IGNORE_TITLE_WORDS:
+            if len(label) < 4:
+                continue
+            # "basi" is a clipped "basic"; "stagei" is "stage" plus a stray character.
+            if label.startswith(w) or (len(label) >= 5 and w.startswith(label)):
+                return True
+    return False
 
 # "227/182" style: digits only on both sides.
 DIGIT_SLASH_RE = re.compile(r"(?<!\d)(\d{1,3})\s*/\s*(\d{1,3})(?!\d)")
@@ -24,6 +46,46 @@ PREFIXED_SLASH_RE = re.compile(r"\b(TG|GG|SV)\s?(\d{1,3})\s*/\s*(TG|GG|SV)?\s?(\
 PROMO_RE = re.compile(r"\b(SVP|SWSH|SM|XY|BW|HGSS|DP|TG|GG)\s?-?\s?(\d{1,3})\b")
 
 EARLY_EXIT_TITLE_SCORE = 6.0  # about 7+ letters read at roughly 85% confidence
+
+# OCR bands as (label, y0, y1, x0, x1) fractions of the normalized card. Pokemon names sit
+# right of the Basic/Stage label; Trainer and Energy names sit lower, under the
+# Supporter/Item ribbon. The collector number is in the bottom-left or bottom-right corner.
+TITLE_BANDS = [
+    ("pokemon_name", .030, .100, .12, .79),
+    ("with_label", .030, .105, .03, .82),
+    ("trainer_name", .070, .145, .03, .82),
+]
+NUMBER_BANDS = [
+    ("bottom_left", .93, .99, .02, .45),
+    ("bottom_right", .93, .99, .55, .98),
+    ("lower_left", .90, .99, .02, .50),
+]
+
+
+def _crop(gray, band):
+    _, y0, y1, x0, x1 = band
+    h, w = gray.shape[:2]
+    return gray[int(h * y0):int(h * y1), int(w * x0):int(w * x1)]
+
+
+def debug_overlay(card_bgr, max_width=520):
+    """Normalized card with the OCR bands drawn on it (green = title, red = number).
+
+    Shows at a glance whether the bands line up with the printed text. If they don't, the
+    card boundary or the band positions are the problem, not the OCR itself.
+    """
+    img = card_bgr.copy()
+    h, w = img.shape[:2]
+    thick = max(2, w // 300)
+    for color, bands in (((0, 160, 0), TITLE_BANDS), ((0, 0, 220), NUMBER_BANDS)):
+        for label, y0, y1, x0, x1 in bands:
+            p1, p2 = (int(w * x0), int(h * y0)), (int(w * x1), int(h * y1))
+            cv2.rectangle(img, p1, p2, color, thick)
+            cv2.putText(img, label, (p1[0] + 6, p2[1] - 8), cv2.FONT_HERSHEY_SIMPLEX,
+                        w / 1500 * 0.9, color, thick)
+    scale = max_width / float(w)
+    return cv2.resize(img, (max_width, int(h * scale)), interpolation=cv2.INTER_AREA)
+
 
 NUMBER_WHITELIST_DIGITS = "0123456789/"
 # No space or hyphen in whitelists: pytesseract splits the config on spaces.
@@ -85,7 +147,7 @@ def _clean_name(text):
     words = []
     for word in text.split():
         clean = re.sub(r"[^A-Za-z'’-]", "", word)
-        if len(clean) >= 2 and clean.lower() not in IGNORE_TITLE_WORDS:
+        if len(clean) >= 2 and not _is_label(clean):
             words.append(clean)
     # Drop trailing 1-2 letter ALL-CAPS fragments (usually a clipped "HP" label), but keep
     # real name suffixes like EX and GX.
@@ -117,7 +179,7 @@ def _read_title(gray_band):
                 continue
             kept.append(text)
             letters = re.sub(r"[^A-Za-z]", "", text)
-            if len(letters) >= 3 and letters.lower() not in IGNORE_TITLE_WORDS:
+            if len(letters) >= 3 and not _is_label(letters):
                 score += (conf / 100.0) * len(letters)
         cleaned = _clean_name(" ".join(kept))
         if cleaned:
@@ -132,13 +194,9 @@ def extract_card_signals(card_bgr):
     # ---- Title -------------------------------------------------------------
     # Tight single-line bands. Pokemon names sit right of the Basic/Stage label; Trainer
     # and Energy names sit lower, under the Supporter/Item ribbon.
-    title_regions = [
-        ("pokemon_name", gray[int(h * .030):int(h * .100), int(w * .12):int(w * .79)]),
-        ("with_label", gray[int(h * .030):int(h * .105), int(w * .03):int(w * .82)]),
-        ("trainer_name", gray[int(h * .070):int(h * .145), int(w * .03):int(w * .82)]),
-    ]
     title_reads = []  # (cleaned, score, "band/mode", raw)
-    for label, crop in title_regions:
+    for band in TITLE_BANDS:
+        label, crop = band[0], _crop(gray, band)
         if not crop.size:
             continue
         for cleaned, score, mode, raw in _read_title(crop):
@@ -155,13 +213,9 @@ def extract_card_signals(card_bgr):
     # ---- Collector number --------------------------------------------------
     # Strict patterns only. If nothing matches, the number stays empty, which is
     # better than feeding garbage into the matcher as if it were evidence.
-    number_regions = [
-        ("bottom_left", gray[int(h * .93):int(h * .99), int(w * .02):int(w * .45)]),
-        ("bottom_right", gray[int(h * .93):int(h * .99), int(w * .55):int(w * .98)]),
-        ("lower_left", gray[int(h * .90):int(h * .99), int(w * .02):int(w * .50)]),
-    ]
     number_candidates = []  # (quality, value, region label, raw text)
-    for label, crop in number_regions:
+    for band in NUMBER_BANDS:
+        label, crop = band[0], _crop(gray, band)
         if not crop.size:
             continue
         for mode in ("otsu", "blackhat"):

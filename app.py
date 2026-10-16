@@ -2,12 +2,13 @@ import io
 import re
 import uuid
 
+import cv2
 import pandas as pd
 import streamlit as st
 from PIL import Image
 
 from tcgcomping.image_processor import decode_image, normalize_card
-from tcgcomping.ocr_engine import extract_card_signals
+from tcgcomping.ocr_engine import extract_card_signals, debug_overlay
 from tcgcomping.card_matcher import rank_candidates
 from tcgcomping.card_database import search_cards
 
@@ -88,6 +89,16 @@ if run_scan:
                 image = decode_image(raw_bytes)
                 aligned, alignment_note = normalize_card(image)
                 signals = extract_card_signals(aligned)
+
+                # Diagnostic picture of where OCR looked. A failure here must not lose the scan.
+                try:
+                    ok, buf = cv2.imencode(
+                        ".jpg", debug_overlay(aligned), [cv2.IMWRITE_JPEG_QUALITY, 80]
+                    )
+                    overlay_bytes = buf.tobytes() if ok else None
+                except Exception:
+                    overlay_bytes = None
+
                 ranked = best_candidates(signals, aligned)
 
                 best = ranked[0] if ranked else None
@@ -123,6 +134,7 @@ if run_scan:
                     "ocr_total": signals.get("printed_total") or "",
                     "ocr_set_hint": signals.get("set_hint") or "",
                     "ocr_debug": signals.get("debug") or "",
+                    "ocr_overlay": overlay_bytes,
                     "alignment_note": alignment_note,
                     "candidates": ranked,
                     "matched_card": chosen,
@@ -216,6 +228,11 @@ if cards:
 
                 if card.get("ocr_debug"):
                     with st.expander("OCR diagnostics"):
+                        if card.get("ocr_overlay"):
+                            st.image(
+                                card["ocr_overlay"],
+                                caption="Normalized card with OCR bands (green = title, red = number)",
+                            )
                         st.code(card["ocr_debug"])
 
                 candidates = card.get("candidates") or []
