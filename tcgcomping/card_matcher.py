@@ -1,18 +1,41 @@
 """Candidate scoring and confidence-aware ranking."""
 import re
+
 from rapidfuzz import fuzz
+
+# Keys a card database might use for the set's printed card count.
+_TOTAL_KEYS = ("printed_total", "set_total", "total", "card_count", "official")
+
 
 def _norm(value):
     return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
 
+
 def _number_forms(value):
+    """Equivalent spellings of a collector number.
+
+    OCR usually gives "227/182" while databases usually store "227", so the
+    numerator alone is included as a form. Leading zeros are normalized.
+    """
     value = str(value or "").upper().replace(" ", "")
     value = re.sub(r"[^A-Z0-9/]", "", value)
-    forms = {value}
+    forms = set()
     if "/" in value:
-        left, right = value.split("/", 1)
-        forms.add(left.lstrip("0") + "/" + right.lstrip("0"))
-    return {x for x in forms if x}
+        left = value.split("/", 1)[0]
+        forms.update({value, left, left.lstrip("0") or "0"})
+    elif value:
+        forms.update({value, value.lstrip("0") or "0"})
+    return forms
+
+
+def _candidate_total(candidate):
+    for key in _TOTAL_KEYS:
+        raw = candidate.get(key)
+        digits = re.sub(r"\D", "", str(raw or ""))
+        if digits:
+            return digits.lstrip("0")
+    return ""
+
 
 def rank_candidates(signals, candidates, aligned_image=None):
     """Score name strongly; collector number is strong evidence when present.
@@ -23,22 +46,28 @@ def rank_candidates(signals, candidates, aligned_image=None):
     query_name = signals.get("name", "")
     query_number = signals.get("number", "")
     query_set = signals.get("set_hint", "")
+    query_total = re.sub(r"\D", "", str(signals.get("printed_total", "") or "")).lstrip("0")
     ranked = []
 
     for candidate in candidates:
-        name_score = fuzz.WRatio(_norm(query_name), _norm(candidate.get("name", ""))) / 100 if query_name else 0.0
-        cand_number = str(candidate.get("number", ""))
-        qforms, cforms = _number_forms(query_number), _number_forms(cand_number)
+        name_score = (
+            fuzz.WRatio(_norm(query_name), _norm(candidate.get("name", ""))) / 100
+            if query_name else 0.0
+        )
+
+        # Exact match on an equivalent form only. Substring matching was removed
+        # because garbage like "TE002274" used to match "227".
+        qforms = _number_forms(query_number)
+        cforms = _number_forms(candidate.get("number", ""))
         number_score = 1.0 if qforms and cforms and qforms.intersection(cforms) else 0.0
-        # A partial OCR number can still contribute modest evidence.
-        if not number_score and query_number and cand_number:
-            qclean, cclean = _norm(query_number), _norm(cand_number)
-            if len(qclean) >= 2 and (qclean in cclean or cclean in qclean):
-                number_score = 0.45
 
         set_score = 0.0
         if query_set:
             set_score = fuzz.WRatio(_norm(query_set), _norm(candidate.get("set_name", ""))) / 100
+        # A matching printed total (the 182 in 227/182) is strong set evidence.
+        cand_total = _candidate_total(candidate)
+        if query_total and cand_total and query_total == cand_total:
+            set_score = max(set_score, 1.0)
 
         # Weights are intentionally transparent and easy to tune.
         if query_number:
@@ -61,5 +90,12 @@ def rank_candidates(signals, candidates, aligned_image=None):
         }
         ranked.append(item)
 
-    ranked.sort(key=lambda x: (x["confidence"], x["evidence"]["collector_number_score"], x["evidence"]["name_score"]), reverse=True)
+    ranked.sort(
+        key=lambda x: (
+            x["confidence"],
+            x["evidence"]["collector_number_score"],
+            x["evidence"]["name_score"],
+        ),
+        reverse=True,
+    )
     return ranked[:10]

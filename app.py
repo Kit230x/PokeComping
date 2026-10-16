@@ -1,5 +1,7 @@
 import io
+import re
 import uuid
+
 import pandas as pd
 import streamlit as st
 from PIL import Image
@@ -19,12 +21,34 @@ st.caption(
 if "batch" not in st.session_state:
     st.session_state.batch = []
 
+PLACEHOLDER = "— Select a candidate —"
+
 
 def safe_float(value, default=0.0):
     try:
         return float(value) if value is not None else default
     except (TypeError, ValueError):
         return default
+
+
+def usable_name(name):
+    """Reject junk OCR like 'Ke' before it ever reaches the database."""
+    return len(re.sub(r"[^A-Za-z]", "", name or "")) >= 4
+
+
+def best_candidates(signals, aligned):
+    """Search every plausible title read and keep the best-ranked result."""
+    names = signals.get("name_candidates") or (
+        [signals["name"]] if signals.get("name") else []
+    )
+    best_ranked, best_conf = [], -1.0
+    for nm in names[:4]:
+        if not usable_name(nm):
+            continue
+        ranked = rank_candidates({**signals, "name": nm}, search_cards(nm), aligned)
+        if ranked and ranked[0]["confidence"] > best_conf:
+            best_ranked, best_conf = ranked, ranked[0]["confidence"]
+    return best_ranked
 
 
 with st.sidebar:
@@ -64,8 +88,7 @@ if run_scan:
                 image = decode_image(raw_bytes)
                 aligned, alignment_note = normalize_card(image)
                 signals = extract_card_signals(aligned)
-                candidates = search_cards(signals.get("name") or "")
-                ranked = rank_candidates(signals, candidates, aligned)
+                ranked = best_candidates(signals, aligned)
 
                 best = ranked[0] if ranked else None
                 number_score = (best or {}).get("evidence", {}).get("collector_number_score", 0) or 0
@@ -79,22 +102,32 @@ if run_scan:
                 )
                 chosen = best if (allow_auto and auto_ok) else None
 
+                name_ok = usable_name(signals.get("name")) or any(
+                    usable_name(n) for n in signals.get("name_candidates") or []
+                )
+                if chosen:
+                    item_status = "Auto-suggested"
+                elif ranked:
+                    item_status = "Needs review"
+                elif not name_ok:
+                    item_status = "Name unreadable — search manually"
+                else:
+                    item_status = "No candidates"
+
                 new_items.append({
                     "id": str(uuid.uuid4()),
                     "filename": uploaded.name,
                     "local_bytes": raw_bytes,
                     "ocr_name": signals.get("name") or "",
                     "ocr_number": signals.get("number") or "",
+                    "ocr_total": signals.get("printed_total") or "",
                     "ocr_set_hint": signals.get("set_hint") or "",
                     "ocr_debug": signals.get("debug") or "",
                     "alignment_note": alignment_note,
                     "candidates": ranked,
                     "matched_card": chosen,
                     "confirmed": False,
-                    "status": (
-                        "Auto-suggested" if chosen
-                        else ("Needs review" if ranked else "No candidates")
-                    ),
+                    "status": item_status,
                 })
             except Exception as exc:
                 new_items.append({
@@ -103,6 +136,7 @@ if run_scan:
                     "local_bytes": raw_bytes,
                     "ocr_name": "",
                     "ocr_number": "",
+                    "ocr_total": "",
                     "ocr_set_hint": "",
                     "ocr_debug": f"Processing error: {exc}",
                     "alignment_note": "Image processing failed",
@@ -148,7 +182,7 @@ if cards:
 
     for card in display_cards:
         with st.container(border=True):
-            scan_col, match_col, info_col, action_col = st.columns([1.2, 1.25, 3.1, 0.8])
+            scan_col, match_col, info_col, action_col = st.columns([1.2, 1.5, 2.9, 1.0])
 
             with scan_col:
                 st.caption(card["filename"])
@@ -186,38 +220,47 @@ if cards:
 
                 candidates = card.get("candidates") or []
                 if candidates:
-                    labels = [
+                    # Index 0 is a placeholder so nothing is selected until a person picks it.
+                    labels = [PLACEHOLDER] + [
                         f"{c.get('name') or 'Unknown card'} — {c.get('set_name') or 'Unknown set'} "
                         f"(#{c.get('number') or '?'}) | {safe_float(c.get('confidence')):.0%} | "
                         f"${safe_float(c.get('market_price')):.2f}"
                         for c in candidates
                     ]
+                    options = list(range(len(labels)))
 
                     select_key = f"candidate_{card['id']}"
                     # Seed session state once so the selectbox stays consistent across reruns
                     if select_key not in st.session_state:
                         idx = next(
                             (
-                                i
+                                i + 1
                                 for i, c in enumerate(candidates)
                                 if match and c.get("id") == match.get("id")
                             ),
-                            0,
+                            0,  # placeholder when nothing was auto-selected
                         )
-                        st.session_state[select_key] = labels[min(idx, len(labels) - 1)]
+                        st.session_state[select_key] = idx
 
-                    chosen_label = st.selectbox(
+                    selected_idx = st.selectbox(
                         "Candidate review",
-                        labels,
+                        options,
+                        format_func=lambda i, labels=labels: labels[i],
                         key=select_key,
                     )
-                    selected_idx = labels.index(chosen_label)
-                    selected = candidates[selected_idx]
 
-                    if not match or selected.get("id") != match.get("id"):
-                        card["matched_card"] = selected
+                    if selected_idx > 0:
+                        selected = candidates[selected_idx - 1]
+                        if not match or selected.get("id") != match.get("id"):
+                            card["matched_card"] = selected
+                            card["confirmed"] = False
+                            card["status"] = "Manually selected — not yet confirmed"
+                            st.rerun()
+                    elif match:
+                        # The person moved the selection back to the placeholder.
+                        card["matched_card"] = None
                         card["confirmed"] = False
-                        card["status"] = "Manually selected — not yet confirmed"
+                        card["status"] = "Needs review"
                         st.rerun()
 
                     match = card.get("matched_card")
@@ -256,38 +299,40 @@ if cards:
                     key=f"manual_{card['id']}",
                 )
                 if st.button("Retry search", key=f"retry_{card['id']}"):
-                    fresh = search_cards(manual_term)
-                    # Pass None only if your rank_candidates treats image as optional.
-                    # If it does not, decode the local bytes again here.
-                    try:
-                        aligned_img = None
-                        if card.get("local_bytes"):
-                            aligned_img = decode_image(card["local_bytes"])
-                            aligned_img, _ = normalize_card(aligned_img)
-                    except Exception:
-                        aligned_img = None
+                    if not usable_name(manual_term):
+                        st.warning("Enter at least 4 letters of the card name.")
+                    else:
+                        fresh = search_cards(manual_term)
+                        # rank_candidates treats the image as optional, so a failed decode is fine.
+                        try:
+                            aligned_img = None
+                            if card.get("local_bytes"):
+                                aligned_img = decode_image(card["local_bytes"])
+                                aligned_img, _ = normalize_card(aligned_img)
+                        except Exception:
+                            aligned_img = None
 
-                    card["candidates"] = rank_candidates(
-                        {
-                            "name": manual_term,
-                            "number": card.get("ocr_number") or "",
-                            "set_hint": card.get("ocr_set_hint") or "",
-                        },
-                        fresh,
-                        aligned_img,
-                    )
-                    card["matched_card"] = (
-                        card["candidates"][0] if card["candidates"] else None
-                    )
-                    card["confirmed"] = False
-                    card["status"] = (
-                        "Needs review" if card["candidates"] else "No candidates"
-                    )
-                    # Reset the selectbox key so the new candidate list is shown cleanly
-                    select_key = f"candidate_{card['id']}"
-                    if select_key in st.session_state:
-                        del st.session_state[select_key]
-                    st.rerun()
+                        card["candidates"] = rank_candidates(
+                            {
+                                "name": manual_term,
+                                "number": card.get("ocr_number") or "",
+                                "printed_total": card.get("ocr_total") or "",
+                                "set_hint": card.get("ocr_set_hint") or "",
+                            },
+                            fresh,
+                            aligned_img,
+                        )
+                        # Nothing is selected until a person picks a candidate.
+                        card["matched_card"] = None
+                        card["confirmed"] = False
+                        card["status"] = (
+                            "Needs review" if card["candidates"] else "No candidates"
+                        )
+                        # Reset the selectbox key so the new candidate list is shown cleanly
+                        select_key = f"candidate_{card['id']}"
+                        if select_key in st.session_state:
+                            del st.session_state[select_key]
+                        st.rerun()
 
             with action_col:
                 st.write("")
@@ -345,7 +390,7 @@ if any(c.get("matched_card") for c in st.session_state.batch):
 if cards:
     if st.button("Clear entire queue", type="secondary"):
         st.session_state.batch = []
-        # Optional: wipe candidate/manual keys so a fresh batch starts clean
+        # Wipe candidate/manual keys so a fresh batch starts clean
         for k in list(st.session_state.keys()):
             if k.startswith(("candidate_", "manual_", "confirm_", "retry_", "exclude_")):
                 del st.session_state[k]
