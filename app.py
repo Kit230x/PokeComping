@@ -1,375 +1,352 @@
-import streamlit as st
-import requests
-from PIL import Image
-import pytesseract
-import cv2
-import numpy as np
 import io
-import re
-from rapidfuzz import process, fuzz
+import uuid
+import pandas as pd
+import streamlit as st
+from PIL import Image
 
-st.set_page_config(page_title="TCGComping - Automated Verification Queue", layout="wide")
+from tcgcomping.image_processor import decode_image, normalize_card
+from tcgcomping.ocr_engine import extract_card_signals
+from tcgcomping.card_matcher import rank_candidates
+from tcgcomping.card_database import search_cards
 
+st.set_page_config(page_title="TCGComping — Verification Queue", layout="wide")
+st.title("🗂️ TCGComping — Verification Queue")
+st.caption(
+    "Modular Pokémon card identification with confidence-aware suggestions. "
+    "Review uncertain matches before pricing or export."
+)
 
-# ---------------------------------------------------------
-# Computer Vision: Card Boundary Detection & Deskewing
-# ---------------------------------------------------------
-def order_points(pts):
-    """Orders coordinates: [top-left, top-right, bottom-right, bottom-left]."""
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-
-def auto_align_card(img, target_w=750, target_h=1050):
-    """
-    Detects the outer boundary of the trading card, removes background
-    margins/scanner bed, deskews tilt, and warps to standard 750x1050 px.
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    # Canny edge detection to pick up card borders
-    edged = cv2.Canny(blurred, 30, 150)
-
-    # Dilate slightly to close gaps in the edge contour
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    dilated = cv2.dilate(edged, kernel, iterations=2)
-
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-
-    card_cnt = None
-    for c in contours:
-        # Require contour to cover at least 30% of the image
-        if cv2.contourArea(c) < (img.shape[0] * img.shape[1] * 0.30):
-            break
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            card_cnt = approx
-            break
-
-    # If 4-point polygon was detected, perform perspective transform
-    if card_cnt is not None:
-        pts = card_cnt.reshape(4, 2)
-        rect = order_points(pts)
-        dst = np.array([
-            [0, 0],
-            [target_w - 1, 0],
-            [target_w - 1, target_h - 1],
-            [0, target_h - 1]
-        ], dtype="float32")
-        M = cv2.getPerspectiveTransform(rect, dst)
-        warped = cv2.warpPerspective(img, M, (target_w, target_h))
-        return warped
-
-    # Fallback: if edges blend into background, resize directly to target dimensions
-    return cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
-
-
-# ---------------------------------------------------------
-# Local Computer Vision & OCR
-# ---------------------------------------------------------
-def extract_card_info_ocr(image_bytes):
-    try:
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        raw_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if raw_img is None:
-            return "", ""
-
-        # 1. Standardize card canvas to 750w x 1050h
-        img = auto_align_card(raw_img, target_w=750, target_h=1050)
-
-        # -------------------------------------------------------------
-        # 2. TITLE EXTRACTION (Standardized coordinates: Y: 40-120, X: 35-430)
-        # -------------------------------------------------------------
-        title_crop = img[40:120, 35:430]
-        t_gray = cv2.cvtColor(title_crop, cv2.COLOR_BGR2GRAY)
-        t_scale = cv2.resize(t_gray, (0, 0), fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
-        t_blur = cv2.GaussianBlur(t_scale, (3, 3), 0)
-        _, t_thresh = cv2.threshold(t_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        if np.mean(t_thresh) < 127:
-            t_thresh = cv2.bitwise_not(t_thresh)
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        t_clean = cv2.morphologyEx(t_thresh, cv2.MORPH_OPEN, kernel)
-
-        raw_title = pytesseract.image_to_string(t_clean, config="--psm 6").strip()
-
-        ignore_words = {'stage', 'basic', 'evolves', 'from', 'hp', 'vstar', 'vmax'}
-        cleaned_words = []
-        for word in raw_title.split():
-            clean = re.sub(r'[^a-zA-Z]', '', word)
-            if len(clean) >= 2 and clean.lower() not in ignore_words:
-                cleaned_words.append(clean)
-
-        cleaned_title = " ".join(cleaned_words)
-
-        # -------------------------------------------------------------
-        # 3. COLLECTOR NUMBER (Dual-Zone Normalized Scanner)
-        # -------------------------------------------------------------
-        detected_number = ""
-
-        # Normalized Modern BL: Y: 980-1035, X: 25-260
-        modern_bl = img[980:1035, 25:260]
-
-        # Normalized Vintage/EX BR: Y: 965-1035, X: 520-720
-        vintage_br = img[965:1035, 520:720]
-
-        for reg in [modern_bl, vintage_br]:
-            gray = cv2.cvtColor(reg, cv2.COLOR_BGR2GRAY)
-            scale = cv2.resize(gray, (0, 0), fx=3.5, fy=3.5, interpolation=cv2.INTER_CUBIC)
-
-            _, thresh_norm = cv2.threshold(scale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            thresh_inv = cv2.bitwise_not(thresh_norm)
-
-            for candidate in [thresh_norm, thresh_inv]:
-                if np.mean(candidate) < 127:
-                    candidate = cv2.bitwise_not(candidate)
-
-                padded = cv2.copyMakeBorder(candidate, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=255)
-
-                raw_corner = pytesseract.image_to_string(
-                    padded,
-                    config="--psm 7 -c tessedit_char_whitelist=0123456789/"
-                ).strip()
-
-                match_slash = re.search(r'(\d{1,4})/\d{1,4}', raw_corner)
-                if match_slash:
-                    detected_number = match_slash.group(1).lstrip("0")
-                    break
-
-            if detected_number:
-                break
-
-        return cleaned_title, detected_number
-    except Exception as e:
-        print(f"OCR Error: {e}")
-        return "", ""
-
-
-# ---------------------------------------------------------
-# TCGdex API + Fuzzy Matching
-# ---------------------------------------------------------
-def search_tcgdex(card_name, detected_num=""):
-    clean_name = card_name.strip()
-    if not clean_name:
-        return []
-
-    seed = clean_name[:4] if len(clean_name) >= 4 else clean_name
-    url = f"https://api.tcgdex.net/v2/en/cards?name={seed}"
-
-    try:
-        res = requests.get(url, timeout=8)
-        if res.status_code == 200:
-            brief_list = res.json()
-            if not isinstance(brief_list, list) or not brief_list:
-                return []
-
-            name_choices = {item["id"]: item["name"] for item in brief_list}
-            scored_matches = process.extract(
-                clean_name,
-                name_choices,
-                scorer=fuzz.ratio,
-                limit=10
-            )
-
-            matches = []
-            for candidate_name, score, card_id in scored_matches:
-                d_res = requests.get(f"https://api.tcgdex.net/v2/en/cards/{card_id}", timeout=5)
-                if d_res.status_code == 200:
-                    d = d_res.json()
-                    pricing = (d.get("pricing") or {}).get("tcgplayer") or {}
-
-                    market_val = 0.0
-                    for variant in ["normal", "reverse", "holo"]:
-                        var_obj = pricing.get(variant)
-                        if isinstance(var_obj, dict) and var_obj.get("marketPrice"):
-                            market_val = float(var_obj["marketPrice"])
-                            break
-
-                    matches.append({
-                        "id": d.get("id"),
-                        "name": d.get("name"),
-                        "set_name": d.get("set", {}).get("name", "Unknown Set"),
-                        "number": str(d.get("localId", "")).strip(),
-                        "image_url": f"{d.get('image')}/high.webp" if d.get("image") else None,
-                        "market_price": market_val
-                    })
-
-            if detected_num:
-                matches.sort(
-                    key=lambda x: 0 if str(x["number"]).lstrip("0") == str(detected_num).lstrip("0") else 1
-                )
-
-            return matches
-    except Exception as e:
-        print(f"TCGdex error: {e}")
-    return []
-
-
-# ---------------------------------------------------------
-# App Session & Batch State
-# ---------------------------------------------------------
 if "batch" not in st.session_state:
     st.session_state.batch = []
 
-st.sidebar.title("📥 Batch Intake (NM Only)")
-uploaded_files = st.sidebar.file_uploader(
-    "Drop Front Scans Here",
-    type=["jpg", "jpeg", "png"],
-    accept_multiple_files=True
-)
 
-if st.sidebar.button("⚡ Scan & Auto-Comp Batch", type="primary"):
-    if uploaded_files:
+def safe_float(value, default=0.0):
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+with st.sidebar:
+    st.header("📥 Batch intake")
+    uploads = st.file_uploader(
+        "Upload front scans",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+    )
+    st.subheader("Identification settings")
+    game = st.selectbox(
+        "Game",
+        ["Pokémon"],
+        help="The pipeline is structured so game-specific adapters can be added later.",
+    )
+    allow_auto = st.checkbox("Allow high-confidence auto-selection", value=True)
+    threshold = st.slider("Auto-selection confidence", 0.50, 0.98, 0.88, 0.01)
+    run_scan = st.button("⚡ Scan & identify batch", type="primary", use_container_width=True)
+
+if run_scan:
+    if not uploads:
+        st.warning("Upload at least one card scan first.")
+    else:
         existing = {c["filename"] for c in st.session_state.batch}
-        for file in uploaded_files:
-            if file.name not in existing:
-                raw_bytes = file.read()
+        progress = st.progress(0)
+        status = st.empty()
+        new_items = []
 
-                detected_name, detected_number = extract_card_info_ocr(raw_bytes)
-                matches = search_tcgdex(detected_name, detected_number)
+        for i, uploaded in enumerate(uploads):
+            if uploaded.name in existing:
+                progress.progress((i + 1) / len(uploads))
+                status.write(f"Processed {i + 1} of {len(uploads)} uploads")
+                continue
 
-                st.session_state.batch.append({
-                    "id": f"{file.name}_{len(st.session_state.batch)}",
-                    "filename": file.name,
+            raw_bytes = uploaded.getvalue()
+            try:
+                image = decode_image(raw_bytes)
+                aligned, alignment_note = normalize_card(image)
+                signals = extract_card_signals(aligned)
+                candidates = search_cards(signals.get("name") or "")
+                ranked = rank_candidates(signals, candidates, aligned)
+
+                best = ranked[0] if ranked else None
+                number_score = (best or {}).get("evidence", {}).get("collector_number_score", 0) or 0
+                number_present = bool(signals.get("number"))
+                auto_ok = bool(
+                    best
+                    and best.get("confidence") is not None
+                    and best["confidence"] >= threshold
+                    and best.get("evidence", {}).get("name_score", 0) >= 0.72
+                    and (not number_present or number_score >= 0.99)
+                )
+                chosen = best if (allow_auto and auto_ok) else None
+
+                new_items.append({
+                    "id": str(uuid.uuid4()),
+                    "filename": uploaded.name,
                     "local_bytes": raw_bytes,
-                    "ocr_name": detected_name,
-                    "ocr_number": detected_number,
-                    "matched_card": matches[0] if matches else None,
-                    "suggestions": matches,
-                    "selected_index": 0
+                    "ocr_name": signals.get("name") or "",
+                    "ocr_number": signals.get("number") or "",
+                    "ocr_set_hint": signals.get("set_hint") or "",
+                    "ocr_debug": signals.get("debug") or "",
+                    "alignment_note": alignment_note,
+                    "candidates": ranked,
+                    "matched_card": chosen,
+                    "confirmed": False,
+                    "status": (
+                        "Auto-suggested" if chosen
+                        else ("Needs review" if ranked else "No candidates")
+                    ),
                 })
+            except Exception as exc:
+                new_items.append({
+                    "id": str(uuid.uuid4()),
+                    "filename": uploaded.name,
+                    "local_bytes": raw_bytes,
+                    "ocr_name": "",
+                    "ocr_number": "",
+                    "ocr_set_hint": "",
+                    "ocr_debug": f"Processing error: {exc}",
+                    "alignment_note": "Image processing failed",
+                    "candidates": [],
+                    "matched_card": None,
+                    "confirmed": False,
+                    "status": "Processing error",
+                })
+
+            progress.progress((i + 1) / len(uploads))
+            status.write(f"Processed {i + 1} of {len(uploads)} uploads")
+
+        st.session_state.batch.extend(new_items)
         st.rerun()
 
-# ---------------------------------------------------------
-# Header & Total Valuation Toolbar
-# ---------------------------------------------------------
-st.title("🗂️ TCGComping Verification Queue")
+cards = st.session_state.batch
+valued = [c for c in cards if c.get("matched_card")]
+total_value = sum(safe_float((c["matched_card"] or {}).get("market_price")) for c in valued)
 
-total_cards = len(st.session_state.batch)
-total_value = sum(
-    c["matched_card"]["market_price"]
-    for c in st.session_state.batch
-    if c.get("matched_card")
-)
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Cards in queue", len(cards))
+m2.metric("Selected matches", len(valued))
+m3.metric("Confirmed matches", sum(bool(c.get("confirmed")) for c in cards))
+m4.metric("Selected market value", f"${total_value:,.2f}")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Total Cards", f"{total_cards}")
-c2.metric("Total Market Value", f"${total_value:,.2f}")
-if total_cards > 0:
-    c3.metric("Average / Card", f"${(total_value / total_cards):,.2f}")
+if cards:
+    sort_mode = st.selectbox(
+        "Sort queue",
+        ["Scan order", "Confidence: low to high", "Price: high to low"],
+    )
 
-sort_choice = c4.selectbox("Sort By:", ["Scan Order", "Price: High to Low", "Price: Low to High"])
-if sort_choice == "Price: High to Low":
-    st.session_state.batch.sort(key=lambda x: (x["matched_card"]["market_price"] if x["matched_card"] else 0.0),
-                                reverse=True)
-elif sort_choice == "Price: Low to High":
-    st.session_state.batch.sort(key=lambda x: (x["matched_card"]["market_price"] if x["matched_card"] else 0.0))
+    # Work on a display list so we never mutate session state while sorting for the UI
+    display_cards = list(cards)
+    if sort_mode == "Confidence: low to high":
+        display_cards.sort(
+            key=lambda c: safe_float((c.get("matched_card") or {}).get("confidence"))
+        )
+    elif sort_mode == "Price: high to low":
+        display_cards.sort(
+            key=lambda c: safe_float((c.get("matched_card") or {}).get("market_price")),
+            reverse=True,
+        )
 
-st.markdown("---")
+    for card in display_cards:
+        with st.container(border=True):
+            scan_col, match_col, info_col, action_col = st.columns([1.2, 1.25, 3.1, 0.8])
 
-# ---------------------------------------------------------
-# Verification Queue
-# ---------------------------------------------------------
-if not st.session_state.batch:
-    st.info("Drop your scans in the sidebar and click 'Scan & Auto-Comp Batch'. Cards will comp automatically.")
-else:
-    for card in st.session_state.batch:
-        with st.container():
-            col_scan, col_web, col_info, col_del = st.columns([1.5, 1.5, 3.5, 1])
-
-            with col_scan:
-                st.caption(f"Scan:")
-                st.image(Image.open(io.BytesIO(card["local_bytes"])), width="stretch")
-
-                with st.expander("Show OCR Crop"):
-                    nparr = np.frombuffer(card["local_bytes"], np.uint8)
-                    raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    if raw is not None:
-                        aligned = auto_align_card(raw, 750, 1050)
-                        title_prev = aligned[40:120, 35:430]
-                        modern_bl_prev = aligned[980:1035, 25:260]
-                        vintage_br_prev = aligned[965:1035, 520:720]
-                        st.image(aligned, caption="Detected & Deskewed Card", width="stretch")
-                        st.image(title_prev, caption="Title Region", width="stretch")
-                        st.image(modern_bl_prev, caption="Modern BL Number", width="stretch")
-                        st.image(vintage_br_prev, caption="Vintage BR Number", width="stretch")
-
-            with col_web:
-                st.caption("**Online Match:**")
-                if card["matched_card"] and card["matched_card"].get("image_url"):
-                    st.image(card["matched_card"]["image_url"], width="stretch")
-                else:
-                    st.write("*(No visual match found)*")
-
-            with col_info:
-                display_ocr = card['ocr_name'] or "Not read"
-                if card.get('ocr_number'):
-                    display_ocr += f" (#{card['ocr_number']})"
-                st.write(f"**OCR Detected:** `{display_ocr}`")
-
-                if card["suggestions"]:
-                    opts = [
-                        f"{m['name']} — {m['set_name']} (#{m['number']}) | ${m['market_price']:.2f}"
-                        for m in card["suggestions"]
-                    ]
-                    selected = st.selectbox(
-                        "Swap match variant:",
-                        opts,
-                        index=card["selected_index"],
-                        key=f"sel_{card['id']}"
+            with scan_col:
+                st.caption(card["filename"])
+                try:
+                    st.image(
+                        Image.open(io.BytesIO(card["local_bytes"])),
+                        use_container_width=True,
                     )
-                    idx = opts.index(selected)
-                    if idx != card["selected_index"]:
-                        card["selected_index"] = idx
-                        card["matched_card"] = card["suggestions"][idx]
-                        st.rerun()
+                except Exception:
+                    st.warning("Could not display scan")
+                st.caption(card.get("alignment_note") or "")
 
-                    m = card["matched_card"]
-                    st.markdown(f"### Market Price: :green[**${m['market_price']:.2f}**]")
-                    st.caption(f"{m['set_name']} • #{m['number']} • Near Mint")
+            with match_col:
+                st.markdown("**Suggested match**")
+                match = card.get("matched_card")
+                if match and match.get("image_url"):
+                    try:
+                        st.image(match["image_url"], use_container_width=True)
+                    except Exception:
+                        st.info("Could not load database image")
+                elif match:
+                    st.info("No database image available")
                 else:
-                    new_term = st.text_input("Manual Search (Fallback)", value=card["ocr_name"],
-                                             key=f"manual_{card['id']}")
-                    if st.button("Retry Search", key=f"retry_{card['id']}"):
-                        m_list = search_tcgdex(new_term)
-                        card["suggestions"] = m_list
-                        if m_list:
-                            card["matched_card"] = m_list[0]
+                    st.warning("No match selected")
+
+            with info_col:
+                st.write(f"**OCR name:** `{card.get('ocr_name') or 'Not read'}`")
+                st.write(f"**Collector number:** `{card.get('ocr_number') or 'Not read'}`")
+                if card.get("ocr_set_hint"):
+                    st.write(f"**Set hint:** `{card['ocr_set_hint']}`")
+
+                if card.get("ocr_debug"):
+                    with st.expander("OCR diagnostics"):
+                        st.code(card["ocr_debug"])
+
+                candidates = card.get("candidates") or []
+                if candidates:
+                    labels = [
+                        f"{c.get('name') or 'Unknown card'} — {c.get('set_name') or 'Unknown set'} "
+                        f"(#{c.get('number') or '?'}) | {safe_float(c.get('confidence')):.0%} | "
+                        f"${safe_float(c.get('market_price')):.2f}"
+                        for c in candidates
+                    ]
+
+                    select_key = f"candidate_{card['id']}"
+                    # Seed session state once so the selectbox stays consistent across reruns
+                    if select_key not in st.session_state:
+                        idx = next(
+                            (
+                                i
+                                for i, c in enumerate(candidates)
+                                if match and c.get("id") == match.get("id")
+                            ),
+                            0,
+                        )
+                        st.session_state[select_key] = labels[min(idx, len(labels) - 1)]
+
+                    chosen_label = st.selectbox(
+                        "Candidate review",
+                        labels,
+                        key=select_key,
+                    )
+                    selected_idx = labels.index(chosen_label)
+                    selected = candidates[selected_idx]
+
+                    if not match or selected.get("id") != match.get("id"):
+                        card["matched_card"] = selected
+                        card["confirmed"] = False
+                        card["status"] = "Manually selected — not yet confirmed"
                         st.rerun()
 
-            with col_del:
-                st.write("###")
-                if st.button("🗑️ Exclude", key=f"del_{card['id']}"):
-                    st.session_state.batch = [c for c in st.session_state.batch if c["id"] != card["id"]]
+                    match = card.get("matched_card")
+                    if match:
+                        price = match.get("market_price")
+                        confidence = match.get("confidence")
+                        price_text = (
+                            f"${safe_float(price):.2f}" if price is not None else "Unavailable"
+                        )
+                        confidence_text = (
+                            f"{safe_float(confidence):.0%}"
+                            if confidence is not None
+                            else "Unavailable"
+                        )
+                        st.markdown(f"**Market price:** {price_text}")
+                        st.caption(
+                            f"{match.get('set_name') or 'Unknown set'} • "
+                            f"#{match.get('number') or '?'} • confidence {confidence_text}"
+                        )
+                        with st.expander("Why this candidate ranked here"):
+                            st.json(match.get("evidence") or {})
+
+                        if not card.get("confirmed"):
+                            if st.button("✓ Confirm identification", key=f"confirm_{card['id']}"):
+                                card["confirmed"] = True
+                                card["status"] = "Confirmed"
+                                st.rerun()
+                        else:
+                            st.success("Identification confirmed")
+                else:
+                    st.write("No candidates found. Try improving the scan or enter a name below.")
+
+                manual_term = st.text_input(
+                    "Search by name",
+                    value=card.get("ocr_name") or "",
+                    key=f"manual_{card['id']}",
+                )
+                if st.button("Retry search", key=f"retry_{card['id']}"):
+                    fresh = search_cards(manual_term)
+                    # Pass None only if your rank_candidates treats image as optional.
+                    # If it does not, decode the local bytes again here.
+                    try:
+                        aligned_img = None
+                        if card.get("local_bytes"):
+                            aligned_img = decode_image(card["local_bytes"])
+                            aligned_img, _ = normalize_card(aligned_img)
+                    except Exception:
+                        aligned_img = None
+
+                    card["candidates"] = rank_candidates(
+                        {
+                            "name": manual_term,
+                            "number": card.get("ocr_number") or "",
+                            "set_hint": card.get("ocr_set_hint") or "",
+                        },
+                        fresh,
+                        aligned_img,
+                    )
+                    card["matched_card"] = (
+                        card["candidates"][0] if card["candidates"] else None
+                    )
+                    card["confirmed"] = False
+                    card["status"] = (
+                        "Needs review" if card["candidates"] else "No candidates"
+                    )
+                    # Reset the selectbox key so the new candidate list is shown cleanly
+                    select_key = f"candidate_{card['id']}"
+                    if select_key in st.session_state:
+                        del st.session_state[select_key]
                     st.rerun()
 
-            st.divider()
+            with action_col:
+                st.write("")
+                st.caption(card.get("status", "Needs review"))
+                if st.button("Exclude", key=f"exclude_{card['id']}"):
+                    st.session_state.batch = [
+                        c for c in st.session_state.batch if c["id"] != card["id"]
+                    ]
+                    # Clean up related widget keys
+                    for k in list(st.session_state.keys()):
+                        if card["id"] in str(k):
+                            del st.session_state[k]
+                    st.rerun()
+else:
+    st.info("Upload card front scans in the sidebar to start a batch.")
 
-# ---------------------------------------------------------
-# CSV Export
-# ---------------------------------------------------------
 if any(c.get("matched_card") for c in st.session_state.batch):
-    csv_rows = ["Product Line,Product Name,Set Name,Number,Condition,Printing,Price,Quantity"]
-    for c in st.session_state.batch:
-        if c.get("matched_card"):
-            m = c["matched_card"]
-            csv_rows.append(
-                f'Pokemon,"{m["name"]}","{m["set_name"]}","{m["number"]}",Near Mint,Normal,{m["market_price"]:.2f},1')
-
-    st.download_button(
-        "📥 Download TCGplayer Ready CSV",
-        data="\n".join(csv_rows),
-        file_name="tcgplayer_batch.csv",
-        mime="text/csv"
+    st.divider()
+    export_mode = st.radio(
+        "CSV export rows",
+        ["Confirmed matches only", "All selected matches"],
+        horizontal=True,
     )
+    export_cards = [
+        c
+        for c in st.session_state.batch
+        if c.get("matched_card")
+        and (export_mode == "All selected matches" or c.get("confirmed"))
+    ]
+    rows = []
+    for c in export_cards:
+        m = c["matched_card"]
+        rows.append({
+            "Product Line": "Pokemon",
+            "Product Name": m.get("name") or "",
+            "Set Name": m.get("set_name") or "",
+            "Number": m.get("number") or "",
+            "Condition": "Near Mint",
+            "Printing": "Normal",
+            "Price": f"{safe_float(m.get('market_price')):.2f}",
+            "Quantity": 1,
+            "Identification Confidence": f"{safe_float(m.get('confidence')):.3f}",
+            "Confirmed": bool(c.get("confirmed")),
+            "Source Filename": c["filename"],
+        })
+    csv_bytes = pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "📥 Download TCGplayer-ready CSV",
+        data=csv_bytes,
+        file_name="tcgcomping_batch.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+if cards:
+    if st.button("Clear entire queue", type="secondary"):
+        st.session_state.batch = []
+        # Optional: wipe candidate/manual keys so a fresh batch starts clean
+        for k in list(st.session_state.keys()):
+            if k.startswith(("candidate_", "manual_", "confirm_", "retry_", "exclude_")):
+                del st.session_state[k]
+        st.rerun()
