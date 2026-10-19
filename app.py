@@ -91,9 +91,11 @@ if run_scan:
                 signals = extract_card_signals(aligned)
 
                 # Diagnostic picture of where OCR looked. A failure here must not lose the scan.
+                # If the card was read upside down, show it the way OCR saw it.
+                shown = cv2.rotate(aligned, cv2.ROTATE_180) if signals.get("rotated180") else aligned
                 try:
                     ok, buf = cv2.imencode(
-                        ".jpg", debug_overlay(aligned), [cv2.IMWRITE_JPEG_QUALITY, 80]
+                        ".jpg", debug_overlay(shown), [cv2.IMWRITE_JPEG_QUALITY, 80]
                     )
                     overlay_bytes = buf.tobytes() if ok else None
                 except Exception:

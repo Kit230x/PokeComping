@@ -39,7 +39,7 @@ def _is_label(word):
     return False
 
 # "227/182" style: digits only on both sides.
-DIGIT_SLASH_RE = re.compile(r"(?<!\d)(\d{1,3})\s*/\s*(\d{1,3})(?!\d)")
+DIGIT_SLASH_RE = re.compile(r"(?<!\d)(\d{1,3})\s*/\s*(\d{1,3})")  # up to 3 digits; trailing noise (a star icon) is ignored
 # "TG05/TG30", "GG12/GG70", "SV045/SV122" style.
 PREFIXED_SLASH_RE = re.compile(r"\b(TG|GG|SV)\s?(\d{1,3})\s*/\s*(TG|GG|SV)?\s?(\d{1,3})\b")
 # "SVP 045", "SWSH123" style promos.
@@ -51,14 +51,23 @@ EARLY_EXIT_TITLE_SCORE = 6.0  # about 7+ letters read at roughly 85% confidence
 # right of the Basic/Stage label; Trainer and Energy names sit lower, under the
 # Supporter/Item ribbon. The collector number is in the bottom-left or bottom-right corner.
 TITLE_BANDS = [
-    ("pokemon_name", .030, .100, .12, .79),
-    ("with_label", .030, .105, .03, .82),
-    ("trainer_name", .070, .145, .03, .82),
+    # Measured on a real Stage 2 card after correct alignment: the name's letters span about
+    # 3.8%-7.2% of the card height and the "Evolves from" line starts at ~8.8%, so the first
+    # band stops short of it. Later bands are looser to absorb alignment error.
+    ("pokemon_name", .026, .086, .12, .72),
+    ("name_loose", .018, .096, .10, .74),
+    ("trainer_name", .045, .118, .03, .82),
 ]
 NUMBER_BANDS = [
-    ("bottom_left", .93, .99, .02, .45),
-    ("bottom_right", .93, .99, .55, .98),
-    ("lower_left", .90, .99, .02, .50),
+    # The number sits at ~94.5% height; the copyright line is just below (~97%), so the tight
+    # bands exclude it. Modern cards print the number bottom-left, older ones bottom-right.
+    ("bottom_left", .925, .962, .02, .31),
+    ("bottom_right", .925, .962, .60, .98),
+    # Full-art and illustration-rare layouts print the number about 3% higher, above a thick
+    # bottom border, so the bands above stop just below it (measured on a real Aurorus scan).
+    ("number_row_left", .893, .938, .02, .40),
+    ("bottom_left_wide", .915, .975, .02, .50),
+    ("lower_left", .900, .990, .02, .50),
 ]
 
 
@@ -138,7 +147,10 @@ def _read(gray, psm, whitelist=None, mode="otsu", scale=2.0):
     config = f"--psm {psm}"
     if whitelist:
         config += f" -c tessedit_char_whitelist={whitelist}"
-    return pytesseract.image_to_string(_prepare(gray, scale, mode), config=config).strip()
+    try:
+        return pytesseract.image_to_string(_prepare(gray, scale, mode), config=config).strip()
+    except (pytesseract.TesseractError, RuntimeError):
+        return ""  # Tesseract occasionally crashes on blank or degenerate crops
 
 
 def _clean_name(text):
@@ -165,9 +177,12 @@ def _read_title(gray_band):
     results = []
     for mode in ("otsu", "blackhat", "adaptive"):
         img = _prepare(gray_band, scale=1.0, mode=mode)
-        data = pytesseract.image_to_data(
-            img, config="--psm 7", output_type=pytesseract.Output.DICT
-        )
+        try:
+            data = pytesseract.image_to_data(
+                img, config="--psm 7", output_type=pytesseract.Output.DICT
+            )
+        except (pytesseract.TesseractError, RuntimeError):
+            continue
         kept, score = [], 0.0
         for text, conf in zip(data["text"], data["conf"]):
             text = text.strip()
@@ -187,7 +202,31 @@ def _read_title(gray_band):
     return results
 
 
-def extract_card_signals(card_bgr):
+def _plausible_number(num, total):
+    """Reject collector numbers no real card has (0/5, 1/1, 92/0, 96/980).
+
+    Sets print between about 12 and 400 cards, and secret rares number past the total
+    (092/088), so the numerator may exceed it by up to ~200. Garbage that slips through looks
+    like evidence to the matcher and, worse, makes a wrong orientation look like a good read.
+    """
+    return 10 <= total <= 500 and 1 <= num <= total + 200
+
+
+def _name_variants(name):
+    """The read itself plus versions with trailing 1-2 letter fragments removed.
+
+    "Aurorus At" -> ["Aurorus At", "Aurorus"]. The fragment is usually the start of the
+    "Evolves from" line or a clipped HP label. Real suffixes (ex, GX, V) are kept.
+    """
+    words = name.split()
+    out = [name]
+    while len(words) > 1 and len(words[-1].strip(".'’-")) <= 2 and words[-1].lower() not in {"ex", "gx", "v"}:
+        words = words[:-1]
+        out.append(" ".join(words))
+    return out
+
+
+def _extract(card_bgr):
     h, w = card_bgr.shape[:2]
     gray = cv2.cvtColor(card_bgr, cv2.COLOR_BGR2GRAY)
 
@@ -207,8 +246,23 @@ def extract_card_signals(card_bgr):
 
     title_reads.sort(key=lambda it: it[1], reverse=True)
     good = [t for t in title_reads if t[1] > 0]
-    name = good[0][0] if good else (title_reads[0][0] if title_reads else "")
-    name_candidates = list(dict.fromkeys(t[0] for t in good))
+    title_score = good[0][1] if good else 0.0
+    if good:
+        name = _name_variants(good[0][0])[-1]    # most trimmed form of the best read
+    else:
+        name = title_reads[0][0] if title_reads else ""
+    # Every read, trimmed forms first, so the database search sees the cleanest guess first.
+    # Each read also gets a form without a short leading fragment ("wre Bastiodon" ->
+    # "Bastiodon"). Those are extra candidates only; the displayed name is never altered that
+    # way, because real names start with short words too ("N's Zoroark", "Mr. Mime").
+    name_candidates = []
+    for t in good:
+        variants = list(reversed(_name_variants(t[0])))
+        name_candidates.extend(variants)
+        words = variants[0].split()
+        if len(words) > 1 and len(words[0].strip(".'’-")) <= 3 and len(" ".join(words[1:])) >= 5:
+            name_candidates.append(" ".join(words[1:]))
+    name_candidates = list(dict.fromkeys(name_candidates))
 
     # ---- Collector number --------------------------------------------------
     # Strict patterns only. If nothing matches, the number stays empty, which is
@@ -218,14 +272,14 @@ def extract_card_signals(card_bgr):
         label, crop = band[0], _crop(gray, band)
         if not crop.size:
             continue
-        for mode in ("otsu", "blackhat"):
-            # Pass 1: digits and slash only.
-            for psm in (7, 6):
-                raw = _read(crop, psm, NUMBER_WHITELIST_DIGITS, mode)
+        for mode in ("blackhat", "otsu"):
+            # Pass 1: digits and slash only, at two scales (text this small is scale-sensitive).
+            for scale in (1.5, 2.0):
+                raw = _read(crop, 7, NUMBER_WHITELIST_DIGITS, mode, scale)
                 found = DIGIT_SLASH_RE.search(raw)
-                if found:
+                if found and _plausible_number(int(found.group(1)), int(found.group(2))):
                     value = f"{int(found.group(1))}/{int(found.group(2))}"
-                    number_candidates.append((3, value, f"{label}/{mode}", raw))
+                    number_candidates.append((3, value, f"{label}/{mode}@{scale}", raw))
 
             # Pass 2: letters allowed, for prefixed and promo numbers.
             raw = _read(crop, 7, NUMBER_WHITELIST_LETTERS, mode)
@@ -280,5 +334,33 @@ def extract_card_signals(card_bgr):
         "number": number,
         "printed_total": printed_total,
         "set_hint": set_hint,
+        "title_score": title_score,
+        "rotated180": False,
         "debug": debug,
     }
+
+
+def _quality(signals):
+    """How trustworthy a read looks: confident title letters plus a strict collector number."""
+    return signals["title_score"] + (4.0 if signals["number"] else 0.0)
+
+
+def extract_card_signals(card_bgr):
+    """Read the name and collector number, correcting an upside-down card if needed.
+
+    Card detection can only make the card portrait; it cannot tell right-side-up from
+    upside-down. When the first read is weak, the card is rotated 180 degrees and read again,
+    and the better result wins. The result's "rotated180" flag says which one it was, so the
+    caller can rotate the picture it shows to match.
+    """
+    result = _extract(card_bgr)
+    # Low-resolution scans read the right name with a modest score (about 2.5), while an
+    # upside-down card reads close to nothing, so only a truly unreadable title is retried.
+    if result["title_score"] >= 2.0:
+        return result
+    flipped = _extract(cv2.rotate(card_bgr, cv2.ROTATE_180))
+    if _quality(flipped) > _quality(result) + 1.5:
+        flipped["rotated180"] = True
+        flipped["debug"] = "Card was upside down; read again after rotating 180 degrees.\n" + flipped["debug"]
+        return flipped
+    return result
